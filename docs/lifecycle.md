@@ -2,7 +2,7 @@
 
 ## 不变量与状态归属
 
-1. 每条微信请求至多发送一次回复；成功、失败、取消或发送未知都要结束本次派发占用，下一条请求可继续。未知回执保留用于去重，不能重发原请求。
+1. 每条微信请求至多发送一次微信回复；回复成功、回复失败、取消或回复发送未知都要结束本次派发占用，下一条请求可继续。微信发送未知回执保留用于去重，不能重发回复。转交伙伴失败在两次重试耗尽前保留占用，沿用同一个 targets.send requestKey，不创建新请求。
 2. 取消一组连接、重新登录替换连接或更换 Node 实例后，旧请求不能占用新连接，也不能回传。路由请求、占用和释放只由 ReplyRouter 管理，统一用 cancelBot/finish 清理。
 3. 保存成功的登录在重启后恢复；文件写入/删除成功就是提交边界，随后状态同步失败只报告警告，不能把已提交的状态回滚或丢弃。断开前清理失败保持原登录并返回明确失败；提交后的连接关闭未知返回 DISCONNECT_UNCERTAIN，不声称旧登录恢复。BotManager 管理连接和临时 disconnecting；StateStore 单独串行提交密文。
 4. 新 Node 必须恢复或初始化后才能保存，旧实例的事件不能写入新实例状态。实例身份由 Node 生成，主逻辑只处理当前 instanceId。
@@ -10,8 +10,10 @@
 6. targets.get 只按原 requestKey 查询并核对 executionId、目标与会话。只有明确 settled=true 且本地请求仍 accepted、未预留 replyKey 时，才标记 settled、释放 lane 并通知 Node 拒绝旧请求；该终态没有微信发送成功的含义。开始读取图片前同步预留 replyKey，轮询与超时清理不得撤销正在准备或发送的回传。读取图片失败且尚未提交发送时解除预留，下次完成查询可关闭请求。
 7. 完成查询从 1 秒、5 秒递增到每 15 秒，一个请求至多一个在途查询。finish/reset/cancel 清定时器，迟到查询需复核原 entry、当前 lane 和 accepted 状态；它不能作用于新的请求或连接。查询失败、found=false、缺少 settled 或关联不符均不关闭请求，不重投；权限拒绝/接口不支持停止查询，保留超时。无查询能力保留原 TTL 行为。
 8. 结算原因仅依据匹配回执的 result.outcome：completed/failed/cancelled/interrupted 对应各自的 *_WITHOUT_REPLY 错误，未知或缺少结果为 ENDED_WITHOUT_REPLY，不把 status 或 outputMessageId 当作成功。Node.reject 保持原连接 status，仅将请求码透传到 publicState.lastErrorCode；设置页与面板都使用请求级映射，不引导重扫。
-9. 0.3.2 的微信派发 text 仅为原 entry.text，不加 context/前缀/编号。配置说明用独立普通 targets.send（无微信 entry、无 delegation），在 KV 保存稳定键后发送；保存/重启先查原回执，不能盲目换键。只有可靠 completed 说明回执才让微信消息进入路由；正常处理中的说明共享一次等待查询，微信输入保存在内存，等待计时预算一分钟（查询耗时另计）。缺失/失败/未知或等待超时明确拒绝，用户处理后重发。旧绑定需主人手动初始化，启动/状态查询不主动发说明；有当前微信请求时不发送新的配置说明。
+9. 0.3.2 的微信派发 text 仅为原 entry.text，不加 context/前缀/编号。配置说明用独立普通 targets.send（无微信 entry、无 delegation），在 KV 保存稳定键后发送；保存/重启先查原回执，不能盲目换键。只有可靠 completed 说明回执才让微信消息进入路由；正常处理中的说明共享一次等待查询，微信输入保存在内存，等待计时预算一分钟（查询耗时另计）。缺失/失败/未知或等待超时进入转交重试；用户可在等待期间处理，最终耗尽后明确拒绝并重发。旧绑定需主人手动初始化，启动/状态查询不主动发说明；有当前微信请求时不发送新的配置说明。
 10. 省略 request_id 的回传只按 Host session_context 匹配唯一启用绑定和当前有效 entry，不能指定 Bot 或收件人。成功与拒绝的 implicit callId 绑定在内存中（最多 512 项），重复同一调用不能随队列推进改投；显式 request_id 仍复用原身份、TTL、幂等及发送保护。新的过时调用、缓存被淘汰/重启或同 canonical 的其他轮次无法靠一次说明排除，需 Host turn/input 关联才能硬保证。
+
+11. 转交失败等待 3 分钟重试一次，再失败则等待 10 分钟重试一次；成功取消后续重试，最终失败才通知 Node.reject 并释放 lane 和图片。绑定说明也在每次派发前重新检查；权限拒绝、接口不支持、无效请求及过期不重试。reset/cancel/finish 清重试定时器，旧回调不得派发新绑定。重试不持久化；Node stopped/crashed 立即 reset 路由。snapshot 仅暴露 Bot 标识、重试次数和时间，不暴露消息或凭证。
 
 ## 对称路径矩阵
 

@@ -32,12 +32,74 @@ function routerFixture({ imageSupport = true, readImages } = {}) {
 }
 const inbound = (id = 'request-a') => ({ requestId: id, botConfigId: 'a', generation: 1, text: '描述图片' });
 
-test('voice transcripts and mixed text/images keep their content; absent transcript rejects whole message', () => {
-  const decoded = decodeMessage(wire(1, [{ type: 1, text_item: { text: '问题' } }, { type: 3, voice_item: { text: '语音内容' } }, imageItem()]));
-  assert.equal(decoded.unsupported, false); assert.equal(decoded.images.length, 1); assert.match(decoded.text, /问题.*语音转文字.*语音内容/s);
-  const { manager, state, events } = managerFixture();
-  manager.ingest(state, state.generation, wire(2, [{ type: 1, text_item: { text: '不应部分转发' } }, { type: 3, voice_item: {} }]));
-  assert.equal(events.length, 0); assert.equal(state.lastErrorCode, 'VOICE_TRANSCRIPT_MISSING'); assert.equal(state.stats.rejected, 1); manager.close();
+test('all voice items reject the whole message even with a transcript; converted text remains supported', () => {
+  for (const voice_item of [{}, { text: '' }, { text: '语音内容' }]) {
+    const decoded = decodeMessage(wire(1, [{ type: 1, text_item: { text: '问题' } }, { type: 3, voice_item }, imageItem()]));
+    assert.equal(decoded.unsupported, true); assert.equal(decoded.hasVoice, true); assert.equal(decoded.errorCode, 'VOICE_UNSUPPORTED');
+    assert.equal(decoded.text, '问题');
+  }
+  const decoded = decodeMessage(wire(2, [{ type: 1, text_item: { text: '微信语音转文字后发送的内容' } }, imageItem()]));
+  assert.equal(decoded.unsupported, false); assert.equal(decoded.hasVoice, false); assert.equal(decoded.images.length, 1);
+  assert.equal(decoded.text, '微信语音转文字后发送的内容');
+});
+
+test('poll saves voice messages before replying once to their original peer without companion or image dispatch', { timeout: 3000 }, async t => {
+  const order = [], sends = [], events = []; let done, polls = 0;
+  const delivered = new Promise(resolve => { done = resolve; });
+  const voices = [wire(1, [{ type: 3, voice_item: {} }]),
+    { ...wire(2, [{ type: 3, voice_item: { text: '识别文字' } }]), from_user_id: 'peer-b', context_token: 'context-b' },
+    wire(3, [{ type: 1, text_item: { text: '不要部分转交' } }, imageItem(), { type: 3, voice_item: {} }])];
+  const manager = new BotManager({ checkpoint: async () => { order.push('checkpoint'); assert.equal(manager.bot('a').cursor, 'voice-cursor'); },
+    notify: (method, params) => { events.push({ method, params }); if (method === 'wechat/inbound') { order.push('inbound'); done(params); } } });
+  t.after(() => manager.close()); manager.configure([bot(), bot('b', 'buddy-b')]); const state = manager.bot('a');
+  state.client = { lifecycle: async () => ({}),
+    updates: (_cursor, signal) => ++polls === 1 ? Promise.resolve({ get_updates_buf: 'voice-cursor', msgs: [...voices, voices[0], wire(4, [{ type: 1, text_item: { text: '转换后发送的文字' } }])] }) :
+      new Promise(resolve => signal.addEventListener('abort', () => resolve({ msgs: [] }), { once: true })),
+    send: async req => { order.push('send'); sends.push(req); }, downloadImage: async () => { assert.fail('Rejected mixed voice must not download images'); } };
+  manager.start(state); const event = await delivered;
+  assert.deepEqual(order, ['checkpoint', 'send', 'send', 'send', 'inbound']);
+  assert.equal(event.text, '转换后发送的文字'); assert.equal(events.length, 1);
+  assert.deepEqual(sends.map(req => [req.peerId, req.contextToken, req.text]), [
+    ['peer-a', 'private-context', '暂不支持语音，请使用微信语音转文字后发送。'],
+    ['peer-b', 'context-b', '暂不支持语音，请使用微信语音转文字后发送。'],
+    ['peer-a', 'private-context', '暂不支持语音，请使用微信语音转文字后发送。']]);
+  assert.equal(new Set(sends.map(req => req.clientId)).size, 3);
+  for (const raw of voices) manager.ingest(state, state.generation, raw);
+  const rejected = [...manager.requests.values()].find(entry => entry.hasVoice);
+  await manager.sendVoiceNotice({ requestId: rejected.requestId, botConfigId: 'a', generation: state.generation });
+  await assert.rejects(manager.reply({ requestId: rejected.requestId, generation: state.generation, text: '不能额外回传' }), { code: 'REQUEST_REJECTED' });
+  assert.equal(sends.length, 3); assert.deepEqual(state.stats, { received: 4, delivered: 3, rejected: 3 });
+  assert.equal(state.lastErrorCode, 'VOICE_UNSUPPORTED'); assert.equal(manager.bot('b').stats.delivered, 0);
+  assert.equal(manager.pendingImageBytes, 0);
+});
+
+test('uncertain voice notice is not retried and does not block the next text or mark the connection broken', { timeout: 3000 }, async t => {
+  let done, sends = 0, polls = 0; const delivered = new Promise(resolve => { done = resolve; });
+  const voice = wire(1, [{ type: 3, voice_item: {} }]);
+  const manager = new BotManager({ notify: (method, params) => { if (method === 'wechat/inbound') done(params); } });
+  t.after(() => manager.close()); manager.configure([bot()]); const state = manager.bot('a');
+  state.client = { lifecycle: async () => ({}),
+    updates: (_cursor, signal) => ++polls === 1 ? Promise.resolve({ get_updates_buf: 'cursor', msgs: [voice, voice, wire(2, [{ type: 1, text_item: { text: '下一条文字' } }])] }) :
+      new Promise(resolve => signal.addEventListener('abort', () => resolve({ msgs: [] }), { once: true })),
+    send: async () => { sends++; throw new Error('response lost'); } };
+  manager.start(state); assert.equal((await delivered).text, '下一条文字');
+  const entry = [...manager.requests.values()].find(item => item.hasVoice);
+  await manager.sendVoiceNotice({ requestId: entry.requestId, botConfigId: 'a', generation: state.generation });
+  assert.equal(sends, 1); assert.equal(state.stats.delivered, 0); assert.equal(state.lastErrorCode, 'DELIVERY_UNCERTAIN');
+  assert.equal(state.status, 'connected');
+});
+
+test('voice notice is not sent when saving fails or the binding stops during saving', { timeout: 3000 }, async t => {
+  for (const stopBinding of [false, true]) {
+    let entered, finishSave, sends = 0; const saving = new Promise(resolve => { entered = resolve; });
+    const manager = new BotManager({ checkpoint: () => { entered(); return new Promise((resolve, reject) => { finishSave = stopBinding ? resolve : () => reject(new Error('save failed')); }); } });
+    t.after(() => manager.close()); manager.configure([bot()]); const state = manager.bot('a');
+    state.client = { lifecycle: async () => ({}), updates: async () => ({ get_updates_buf: 'cursor', msgs: [wire(1, [{ type: 3, voice_item: {} }])] }),
+      send: async () => { sends++; } };
+    manager.start(state); const loop = state.loop; await saving;
+    if (stopBinding) manager.stop(state); finishSave(); await loop;
+    assert.equal(sends, 0); if (!stopBinding) assert.equal(state.lastErrorCode, 'PERSISTENCE_FAILED');
+  }
 });
 test('encrypted image download supports hex, base64 raw key, and base64 hex-text without sending Bot token to CDN', async () => {
   const calls = [], client = new IlinkClient({ token: 'private-token', fetchImpl: async (url, init) => { calls.push({ url, init }); return new Response(encrypt(png)); } });
@@ -94,13 +156,18 @@ test('old Host without image attachment capability fails without dropping the im
   assert.equal(sends.length, 0); assert.deepEqual(rejected, [['request-a', 'UNSUPPORTED_CAPABILITY']]);
   assert.equal(router.requests.get('request-a').attachments, undefined);
 });
-test('dispatch failure and cancellation release base64 attachments retained by the router', async () => {
+test('dispatch retries retain image content, then exhaustion or cancellation releases it', async () => {
   const attachment = { base64: png.toString('base64') };
   const { router, rejected } = routerFixture();
+  const timers = []; router.setTimer = callback => { timers.push(callback); return callback; };
+  router.clearTimer = callback => { const index = timers.indexOf(callback); if (index !== -1) timers.splice(index, 1); };
   router.targets.send = async () => { throw Object.assign(new Error('busy'), { code: 'TASK_BUSY' }); };
   await router.receive({ ...inbound(), attachments: [attachment] });
+  assert.equal(router.requests.get('request-a').state, 'retry_wait');
+  assert.deepEqual(router.requests.get('request-a').attachments, [attachment]); assert.equal(rejected.length, 0);
+  await timers.shift()(); await timers.shift()();
   assert.equal(router.requests.get('request-a').state, 'rejected'); assert.equal(router.requests.get('request-a').attachments, undefined);
-  assert.deepEqual(rejected, [['request-a', 'TASK_BUSY']]);
+  assert.deepEqual(rejected, [['request-a', 'DISPATCH_RETRY_EXHAUSTED']]);
   for (const cancel of [r => r.setConfig(validateConfig({ bots: [{ ...bot(), enabled: false }] })), r => r.cancelBot('a'), r => r.reset()]) {
     const { router: pending } = routerFixture(); let finishResolve;
     pending.targets.resolve = () => new Promise(resolve => { finishResolve = resolve; });
@@ -182,11 +249,11 @@ test('poll loop checkpoints before media dispatch and continues past a failed im
     notify: (method, params) => { if (method === 'wechat/inbound') { order.push('inbound'); resolveEvent(params); } } });
   manager.configure([bot()]); const state = manager.bot('a');
   state.client = { lifecycle: async () => ({}),
-    updates: (_cursor, signal) => ++pollCount === 1 ? Promise.resolve({ get_updates_buf: 'cursor-1', msgs: [wire(1, [imageItem()]), wire(2, [{ type: 3, voice_item: { text: '下一条语音' } }])] }) :
+    updates: (_cursor, signal) => ++pollCount === 1 ? Promise.resolve({ get_updates_buf: 'cursor-1', msgs: [wire(1, [imageItem()]), wire(2, [{ type: 1, text_item: { text: '下一条文字' } }])] }) :
       new Promise(resolve => signal.addEventListener('abort', () => resolve({ msgs: [] }), { once: true })),
     downloadImage: async () => { order.push('download'); throw Object.assign(new Error('bad image'), { code: 'INVALID_IMAGE' }); } };
   manager.start(state); const event = await delivered;
-  assert.deepEqual(order, ['checkpoint', 'download', 'inbound']); assert.match(event.text, /下一条语音/);
+  assert.deepEqual(order, ['checkpoint', 'download', 'inbound']); assert.match(event.text, /下一条文字/);
   assert.equal(state.stats.rejected, 1); assert.equal(state.lastErrorCode, 'INVALID_IMAGE'); assert.equal(manager.pendingImageBytes, 0); manager.close();
 });
 test('rebinding during upload cancels image reply before any WeChat send', async () => {

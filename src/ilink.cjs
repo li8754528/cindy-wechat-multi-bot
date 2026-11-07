@@ -107,17 +107,16 @@ function decodeMessage(message) {
       typeof message.context_token !== 'string' || !message.context_token) return null;
   const items = Array.isArray(message.item_list) ? message.item_list : [];
   if (items.length > 20) throw error('BAD_RESPONSE', '单条微信消息包含过多内容。');
-  let unsupported = false, errorCode; const parts = [], images = [];
+  let unsupported = false, hasVoice = false, errorCode; const parts = [], images = [];
   for (const item of items) {
     if (item?.type === 1 && typeof item.text_item?.text === 'string') parts.push(item.text_item.text);
     else if (item?.type === 2 && item.image_item?.media && (item.image_item.media.full_url || item.image_item.media.encrypt_query_param)) images.push(item.image_item);
-    else if (item?.type === 3) {
-      if (typeof item.voice_item?.text === 'string' && item.voice_item.text.trim()) parts.push(`[微信语音转文字]\n${item.voice_item.text}`);
-      else { unsupported = true; errorCode = 'VOICE_TRANSCRIPT_MISSING'; }
-    } else unsupported = true;
+    else if (item?.type === 3) hasVoice = true;
+    else unsupported = true;
   }
   if (images.length > 4) { unsupported = true; errorCode = 'TOO_MANY_IMAGES'; }
+  if (hasVoice) { unsupported = true; errorCode = 'VOICE_UNSUPPORTED'; }
   const text = parts.join('\n');
-  return { id, text, images, unsupported, errorCode, peerId: message.from_user_id, contextToken: message.context_token };
+  return { id, text, images, hasVoice, unsupported, errorCode, peerId: message.from_user_id, contextToken: message.context_token };
 }
 module.exports = { IlinkClient, decodeMessage, tencentUrl, error, AUTH_ORIGIN };

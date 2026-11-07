@@ -40,7 +40,9 @@ function makeHost(shared) {
     companions: { reply: () => { throw new Error('Must not read companion replies'); }, history: () => { throw new Error('Must not read companion history'); } },
     targets: { capabilities: async () => ({ delegation: { execution: true, receiptQuery: shared.receiptQuery ?? true, settled: shared.receiptQuery ?? true } }),
       resolve: async ({ target }) => target, list: async () => ({ targets: [{ id: 'buddy-a', label: 'A' }] }),
-      send: async req => { (req.requestKey.startsWith('wx-guide-') ? guideDispatches : dispatches).push(req); return { accepted: true, taskId: 'session-a', executionId: `execution-${req.requestKey}` }; },
+      send: async req => { (req.requestKey.startsWith('wx-guide-') ? guideDispatches : dispatches).push(req);
+        if (!req.requestKey.startsWith('wx-guide-') && shared.failDispatchCount > 0) { shared.failDispatchCount--; throw Object.assign(new Error('host not ready'), { code: 'HOST_NOT_READY' }); }
+        return { accepted: true, taskId: 'session-a', executionId: `execution-${req.requestKey}` }; },
       get: async ({ requestKey }) => { if (requestKey.startsWith('wx-guide-')) return { found: true, requestKey, taskId: 'session-a',
         target: { kind: 'bot', id: guideDispatches.find(req => req.requestKey === requestKey)?.target.id ?? 'buddy-a' },
         settled: shared.guideSettled !== false, result: { outcome: shared.guideOutcome ?? 'completed' } };
@@ -106,6 +108,36 @@ function makeHost(shared) {
   } };
 }
 const binding = { id: 'a', name: 'A', companionId: 'buddy-a', enabled: false };
+
+test('packaged main reports both pending retry stages, preserves Node input and cancels retry on worker stop', async t => {
+  for (const stop of [false, true]) {
+    const shared = { config: { bots: [{ ...binding, enabled: true }] }, key: null, file: null, receiptQuery: false, failDispatchCount: 2 };
+    const host = makeHost(shared); t.after(() => host.manager.close());
+    await host.tool('list_bindings'); await host.tool('begin_login', { id: 'a' }); await host.tool('check_login', { id: 'a' });
+    const state = host.manager.bot('a');
+    const event = host.manager.ingest(state, state.generation, { message_id: 500, message_type: 1, from_user_id: 'wechat-peer', context_token: 'private-context',
+      item_list: [{ type: 1, text_item: { text: '重试时保留原文' } }] }, false);
+    host.manager.notifyInbound(await host.manager.prepareInbound(event)); await host.drainEvents();
+    const first = (await host.ui('list_bindings')).result;
+    assert.equal(first.dispatchRetries[0].attempt, 1); assert.equal(host.timers[0].delay, 180000);
+    assert.ok(renderSettings(first).error.includes('第 1/2 次')); assert.equal(state.stats.rejected, 0);
+    assert.equal(host.manager.requests.get(event.requestId).state, 'pending');
+    if (stop) {
+      const timer = host.timers[0]; await host.hostMessage({ type: 'event', name: 'node-status', state: 'stopped' });
+      assert.equal(host.timers.length, 0); await timer.callback(); assert.equal(host.dispatches.length, 1);
+    } else {
+      await host.tickReceipt(); const second = (await host.ui('list_bindings')).result;
+      assert.equal(second.dispatchRetries[0].attempt, 2); assert.equal(host.timers[0].delay, 600000);
+      assert.ok(renderSettings(second).error.includes('第 2/2 次')); await host.tickReceipt();
+      assert.equal(host.dispatches.length, 3);
+      assert.ok(host.dispatches.every(req => req.text === '重试时保留原文' && req.requestKey === `wx-${event.requestId}`));
+      assert.equal((await host.ui('list_bindings')).result.dispatchRetries.length, 0);
+      const reply = await host.tool('reply_to_wechat', { text: '仅本次回答', session_context: { session_id: 'session-a' } });
+      assert.equal(reply.ok, true); assert.equal(state.stats.delivered, 1); assert.equal(state.stats.rejected, 0);
+      assert.equal(host.deliveries[0].peerId, 'wechat-peer'); assert.equal(host.timers.length, 0);
+    }
+  }
+});
 
 function renderSettings(snapshot) {
   class Element {

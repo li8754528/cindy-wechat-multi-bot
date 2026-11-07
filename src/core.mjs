@@ -21,12 +21,15 @@ export function validateConfig(value) {
 
 // Reply routing uses only the original request and host-stamped session context.
 // No permission to read companion history and no arbitrary recipient input.
+const DISPATCH_RETRY_DELAYS = [3 * 60000, 10 * 60000];
+const NON_RETRYABLE_DISPATCH = new Set(['PERMISSION_DENIED', 'UNSUPPORTED_CAPABILITY', 'INVALID_PARAMS',
+  'INVALID_INPUT', 'BINDING_CHANGED', 'STALE_CONNECTION', 'REQUEST_EXPIRED', 'REQUEST_KEY_CONFLICT', 'SUPERSEDED']);
 export class ReplyRouter {
-  constructor({ targets, tasks, nodeReply, rejectInbound, readImages = async () => [],
+  constructor({ targets, tasks, nodeReply, rejectInbound, readImages = async () => [], beforeDispatch = async () => {},
     setTimer = (...args) => globalThis.setTimeout(...args),
     clearTimer = (...args) => globalThis.clearTimeout(...args), now = Date.now }) {
     this.targets = targets; this.nodeReply = nodeReply; this.rejectInbound = rejectInbound;
-    this.tasks = tasks; this.readImages = readImages;
+    this.tasks = tasks; this.readImages = readImages; this.beforeDispatch = beforeDispatch;
     this.setTimer = setTimer; this.clearTimer = clearTimer; this.now = now;
     this.routes = new Map(); this.requests = new Map(); this.lanes = new Map(); this.current = new Map(); this.generations = new Map();
     this.bindingSessions = new Map(); this.replyCalls = new Map();
@@ -78,26 +81,55 @@ export class ReplyRouter {
     const previous = this.lanes.get(entry.botConfigId);
     entry.done = new Promise(resolve => { entry.finish = () => {
       if (entry.receiptTimer !== undefined) this.clearTimer(entry.receiptTimer);
+      if (entry.retryTimer !== undefined) this.clearTimer(entry.retryTimer);
+      entry.retryTimer = undefined; entry.nextRetryAt = undefined;
       entry.receiptTimer = undefined; entry.monitorReceipt = false;
       entry.attachments = undefined;
       if (this.current.get(entry.botConfigId) === entry.requestId) this.current.delete(entry.botConfigId);
       if (this.lanes.get(entry.botConfigId) === entry.done) this.lanes.delete(entry.botConfigId); resolve();
     }; });
     this.lanes.set(entry.botConfigId, entry.done);
-    const start = async () => {
+    const start = entry.start = async () => {
       const route = this.routes.get(entry.botConfigId);
       if (entry.state === 'cancelled' || !route?.enabled || route.companionId !== entry.companionId) fail('BINDING_CHANGED', '绑定已改变，不能派发旧消息。');
       if (this.now() - entry.createdAt > 30 * 60000) fail('REQUEST_EXPIRED', '微信请求已过期。');
       this.current.set(entry.botConfigId, entry.requestId); entry.state = 'dispatching'; return this.dispatch(entry);
     };
     entry.accepted = previous ? previous.then(start) : start();
-    const handled = entry.accepted.catch(async error => {
-      entry.state = error.code === 'DELIVERY_UNCERTAIN' ? 'uncertain' : 'rejected';
-      try { await this.rejectInbound(entry.requestId, error.code ?? 'DISPATCH_FAILED'); } finally { entry.finish(); }
-    });
+    const handled = entry.accepted.catch(error => this.dispatchFailed(entry, error));
     if (!previous) await handled; else void handled.catch(() => {});
   }
+  pendingRetries() {
+    return [...this.requests.values()].filter(entry => entry.state === 'retry_wait').map(entry => ({
+      botConfigId: entry.botConfigId, attempt: entry.dispatchRetries, retryAt: entry.nextRetryAt,
+    }));
+  }
+  async dispatchFailed(entry, error) {
+    if (entry.state === 'cancelled' || this.requests.get(entry.requestId) !== entry) return;
+    const route = this.routes.get(entry.botConfigId);
+    if (!route?.enabled || route.companionId !== entry.companionId) error = { code: 'BINDING_CHANGED' };
+    const retry = entry.dispatchRetries ?? 0, delay = DISPATCH_RETRY_DELAYS[retry];
+    if (delay !== undefined && !NON_RETRYABLE_DISPATCH.has(error.code)) {
+      if (this.now() + delay < entry.createdAt + 30 * 60000) {
+        entry.state = 'retry_wait'; entry.dispatchRetries = retry + 1; entry.nextRetryAt = this.now() + delay;
+        entry.retryTimer = this.setTimer(() => {
+          entry.retryTimer = undefined; entry.nextRetryAt = undefined;
+          entry.accepted = entry.start();
+          return entry.accepted.catch(nextError => this.dispatchFailed(entry, nextError));
+        }, delay);
+        entry.retryTimer?.unref?.(); return;
+      }
+      error = { code: 'REQUEST_EXPIRED' };
+    }
+    entry.state = error.code === 'DELIVERY_UNCERTAIN' ? 'uncertain' : 'rejected';
+    const code = retry === 2 && !NON_RETRYABLE_DISPATCH.has(error.code)
+      ? (error.code === 'DELIVERY_UNCERTAIN' ? 'DISPATCH_DELIVERY_UNCERTAIN' : 'DISPATCH_RETRY_EXHAUSTED')
+      : error.code ?? 'DISPATCH_FAILED';
+    try { await this.rejectInbound(entry.requestId, code); } catch { /* Locally closed even if Node is unavailable. */ }
+    finally { entry.finish(); }
+  }
   async dispatch(entry) {
+    await this.beforeDispatch(entry);
     const caps = await this.targets.capabilities({});
     if (caps?.delegation?.execution !== true) fail('UNSUPPORTED_CAPABILITY', '宿主没有可执行的伙伴委派接口，请检查 Cindy 版本与授权。');
     if (entry.attachments?.length) {

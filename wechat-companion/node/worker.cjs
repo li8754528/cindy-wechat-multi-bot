@@ -4808,26 +4808,24 @@ var require_ilink = __commonJS({
       if (!id || typeof message.from_user_id !== "string" || !message.from_user_id || typeof message.context_token !== "string" || !message.context_token) return null;
       const items = Array.isArray(message.item_list) ? message.item_list : [];
       if (items.length > 20) throw error("BAD_RESPONSE", "\u5355\u6761\u5FAE\u4FE1\u6D88\u606F\u5305\u542B\u8FC7\u591A\u5185\u5BB9\u3002");
-      let unsupported = false, errorCode;
+      let unsupported = false, hasVoice = false, errorCode;
       const parts = [], images = [];
       for (const item of items) {
         if (item?.type === 1 && typeof item.text_item?.text === "string") parts.push(item.text_item.text);
         else if (item?.type === 2 && item.image_item?.media && (item.image_item.media.full_url || item.image_item.media.encrypt_query_param)) images.push(item.image_item);
-        else if (item?.type === 3) {
-          if (typeof item.voice_item?.text === "string" && item.voice_item.text.trim()) parts.push(`[\u5FAE\u4FE1\u8BED\u97F3\u8F6C\u6587\u5B57]
-${item.voice_item.text}`);
-          else {
-            unsupported = true;
-            errorCode = "VOICE_TRANSCRIPT_MISSING";
-          }
-        } else unsupported = true;
+        else if (item?.type === 3) hasVoice = true;
+        else unsupported = true;
       }
       if (images.length > 4) {
         unsupported = true;
         errorCode = "TOO_MANY_IMAGES";
       }
+      if (hasVoice) {
+        unsupported = true;
+        errorCode = "VOICE_UNSUPPORTED";
+      }
       const text = parts.join("\n");
-      return { id, text, images, unsupported, errorCode, peerId: message.from_user_id, contextToken: message.context_token };
+      return { id, text, images, hasVoice, unsupported, errorCode, peerId: message.from_user_id, contextToken: message.context_token };
     }
     module2.exports = { IlinkClient, decodeMessage, tencentUrl, error, AUTH_ORIGIN };
   }
@@ -4917,6 +4915,7 @@ var require_worker = __commonJS({
     var { imageBytes, MAX_IMAGE_BYTES } = require_media();
     var MAX_PENDING_IMAGE_BYTES = 40 * 1024 * 1024;
     var IMAGE_CHUNK_CHARS = 192 * 1024;
+    var VOICE_UNSUPPORTED_REPLY = "\u6682\u4E0D\u652F\u6301\u8BED\u97F3\uFF0C\u8BF7\u4F7F\u7528\u5FAE\u4FE1\u8BED\u97F3\u8F6C\u6587\u5B57\u540E\u53D1\u9001\u3002";
     var pause = (ms, signal) => new Promise((resolve) => {
       if (signal?.aborted) return resolve();
       const done = () => {
@@ -5201,6 +5200,10 @@ var require_worker = __commonJS({
             }
             if (signal.aborted || state.generation !== generation) return;
             for (const event of batch) {
+              if (event.voiceNotice) {
+                await this.sendVoiceNotice(event, signal);
+                continue;
+              }
               try {
                 const prepared = await this.prepareInbound(event, signal);
                 if (signal.aborted || state.generation !== generation) return;
@@ -5260,12 +5263,28 @@ var require_worker = __commonJS({
           state.stats.rejected++;
           entry.state = "rejected";
           state.lastErrorCode = message.errorCode ?? "UNSUPPORTED_MESSAGE";
-          return;
+          this.releaseImages(entry);
+          if (!message.hasVoice) return;
+          const event2 = { requestId, botConfigId: state.config.id, generation, voiceNotice: true };
+          if (emit) void this.sendVoiceNotice(event2, state.abort?.signal);
+          return event2;
         }
         const event = { requestId, botConfigId: state.config.id, generation, instanceId: this.instanceId, text: message.text.trim() ? message.text : "\u8BF7\u67E5\u770B\u5FAE\u4FE1\u7528\u6237\u53D1\u9001\u7684\u56FE\u7247\u3002" };
         if (emit && !message.images.length) this.notify("wechat/inbound", event);
         else if (emit) void this.prepareInbound(event, state.abort?.signal).then((prepared) => this.notifyInbound(prepared), (err) => this.reject(requestId, err.code ?? "IMAGE_DOWNLOAD_FAILED"));
         return event;
+      }
+      async sendVoiceNotice({ requestId, botConfigId, generation }, signal) {
+        const entry = this.requests.get(requestId), state = this.bots.get(botConfigId);
+        const current = () => this.requests.get(requestId) === entry && state?.config.enabled && state.client && state.generation === generation && entry?.generation === generation && !signal?.aborted;
+        if (!entry?.hasVoice || entry.state !== "rejected" || entry.noticeAttempted || !current()) return;
+        entry.noticeAttempted = true;
+        try {
+          await state.client.send({ peerId: entry.peerId, contextToken: entry.contextToken, clientId: randomUUID(), text: VOICE_UNSUPPORTED_REPLY }, signal);
+          if (current()) state.stats.delivered++;
+        } catch {
+          if (current()) state.lastErrorCode = "DELIVERY_UNCERTAIN";
+        }
       }
       releaseImages(entry) {
         this.pendingImageBytes -= entry.mediaBytes ?? 0;

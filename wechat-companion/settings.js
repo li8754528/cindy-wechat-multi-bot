@@ -5,7 +5,8 @@ const $ = id => document.getElementById(id);
 const labels = { disconnected: '未登录', waiting_scan: '等待扫码', scanned: '已扫码，请在微信确认', connected: '聊天中',
   paused: '已暂停聊天', qr_expired: '二维码已过期', error: '连接出错', reconnecting: '正在重连', needs_login: '需要重新登录',
   login_requires_action: '需要微信侧处理', storage_error: '登录保存失败', saving_login: '正在保存登录', disconnecting: '正在退出登录' };
-const messageErrors = { VOICE_TRANSCRIPT_MISSING: '微信未返回语音识别文字，请重新发语音或改发文字',
+const messageErrors = { VOICE_UNSUPPORTED: '暂不支持语音，请使用微信语音转文字后发送',
+  VOICE_TRANSCRIPT_MISSING: '暂不支持语音，请使用微信语音转文字后发送',
   TOO_MANY_IMAGES: '单条最多 4 张图片，请分开发送', MEDIA_INBOX_FULL: '等待处理的图片过多，请稍后重发',
   INVALID_IMAGE: '图片无效或解密失败，请重发 PNG/JPEG/WebP 图片', IMAGE_TOO_LARGE: '图片超过 5 MiB，请压缩后重发',
   IMAGE_UPLOAD_FAILED: '图片上传失败，尚未发送回复，请重新发送请求', IMAGE_DOWNLOAD_FAILED: '图片下载失败，请重新发送图片',
@@ -20,6 +21,9 @@ const messageErrors = { VOICE_TRANSCRIPT_MISSING: '微信未返回语音识别�
   ENDED_WITHOUT_REPLY: '最近微信请求：伙伴已结束本次处理，未回传答案。请在 Cindy 查看状态，需要时在微信重新发送请求',
   REQUEST_EXPIRED: '最近微信请求：请求已过期，不能补发回复。请在微信重新发送请求',
   REQUEST_SETTLED: '最近微信请求：请求已结束，不能补发旧回复。请在微信重新发送请求',
+  DISPATCH_RETRY_EXHAUSTED: '最近微信请求：转交伙伴失败，已用完两次自动重试，请在微信重新发送',
+  DISPATCH_DELIVERY_UNCERTAIN: '最近微信请求：转交伙伴结果仍不确定，已结束两次重试，请先在 Cindy 检查',
+  DISPATCH_FAILED: '最近微信请求：未能转交伙伴，请在微信重新发送',
   GUIDE_REQUIRED: '最近微信请求：请先发送一次伙伴说明，再从微信重发请求',
   GUIDE_PENDING: '最近微信请求：伙伴说明正在处理，请完成后从微信重发请求',
   GUIDE_FAILED: '最近微信请求：伙伴说明处理未成功，请重试伙伴说明后重发请求',
@@ -99,7 +103,9 @@ function render() {
       const item = element('span'); item.append(element('strong', String(value)), document.createTextNode(name)); stats.append(item);
     }
     box.append(stats);
-    if (state?.lastErrorCode) box.append(element('p', messageErrors[state.lastErrorCode] ?? `最近连接异常：${state.lastErrorCode}，请刷新状态或重新扫码`, 'bot-error'));
+    const retry = view.dispatchRetries?.find(item => item.botConfigId === bot.id);
+    if (retry) box.append(element('p', `最近微信请求：转交伙伴失败，将于 ${new Date(retry.retryAt).toLocaleTimeString()} 自动重试（第 ${retry.attempt}/2 次）`, 'bot-error'));
+    else if (state?.lastErrorCode) box.append(element('p', messageErrors[state.lastErrorCode] ?? `最近连接异常：${state.lastErrorCode}，请刷新状态或重新扫码`, 'bot-error'));
     const guideState = view.bindingGuides?.find(item => item.id === bot.id)?.state ?? 'required';
     if (bot.companionId && guideMessages[guideState]) box.append(element('p', guideMessages[guideState], 'muted'));
     const actions = element('div', '', 'actions');

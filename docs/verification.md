@@ -2,6 +2,26 @@
 
 目标宿主：本机 Cindy 0.1.128；源码 tag v0.1.128，commit `9d62b213c960c63daa46996de8a606965f2f2299`。
 
+## 0.3.4 转交伙伴失败后两次延迟重试（2026-11-07）
+
+按用户追加要求，ReplyRouter 保留初次转交失败的原输入，等待 3 分钟重试一次，仍失败则再等 10 分钟重试一次。每次重用 wx-<requestId>、原文字/图片和目标伙伴，依赖宿主同键幂等投递。成功停止重试；同 Bot 保持 lane 顺序，其他 Bot 独立。失败重试耗尽才通知 Node 拒绝并释放图片/占用。授权拒绝、接口不支持、无效请求、请求键冲突及过期不重试；投递不确定同键重试而不换键，仍未知则显示 DISPATCH_DELIVERY_UNCERTAIN。微信端回复发送仍不重试。
+
+绑定说明检查移至每次转交前执行，正常处理仍沿用一分钟等待，暂未就绪或查询失败也按转交计划重试。snapshot 给面板返回 Bot 标识、次数、下一次时间，不返回原文/图片/凭证。停用、换绑、连接重置、Node stopped/crashed、reset/finish 清重试定时器；重试只在内存，重启不恢复，仍沿用请求 30 分钟期限。
+
+构建、91/91 自动测试和生成入口语法检查通过。新回归用模拟计时器验证精确 180000/600000 毫秒间隔、第一次/第二次恢复、原图片/文字不变、同 Bot 排队、不同 Bot 独立、同键受理回执丢失、最终失败释放、旧回调/取消/过期、授权拒绝和绑定说明再检查。编译后的 main.js 通过 Host 模拟真实入口，还验证 Node 输入重试期间保持 pending、面板显示第 1/2 与 2/2 次、成功后的伙伴回传，以及 Node stopped 取消重试。未通过真实微信故障或实际等待 3/10 分钟执行端到端验收。
+
+Forge 校验打包 0.3.4，9/9 包内文件 SHA256 与当前构建一致；原位安装返回 updated、namespace local、version 0.3.4、enabled true。随后 list_bindings 确认实际运行 0.3.4，两组 Bot connected、lastErrorCode null、原配置/伙伴绑定不变、绑定说明 ready、credentialStorage sealed、dispatchRetries 空，recoveryError/capabilityError/storageWarning 均 null。本次未主动发送真实微信或伙伴消息，运行状态检查不替代端到端验收。
+
+## 0.3.3 语音直接提示转换为文字（2026-11-07）
+
+按用户要求，所有 type=3 语音消息（包括带 voice_item.text 的消息）整条拒绝，不交给伙伴。插件使用收到的原 peerId/contextToken，直接发送固定文字“暂不支持语音，请使用微信语音转文字后发送。”。微信转换后发送的 type=1 文字照常处理。混合消息中的图片不下载，正文不部分转交。面板显示 VOICE_UNSUPPORTED；成功提示计入回复数，语音计入拒绝数。
+
+沿用原消息去重、游标和加密登录存储；实际轮询先保存接收进度再发送一次提示。同一消息和同一提示调用不重复发送；发送结果不确定显示 DELIVERY_UNCERTAIN，不重发、不把它当连接故障，继续处理后续消息。保存失败或保存期间停用/换绑时不发送提示。崩溃发生在保存后、发送前时可能没有提示，没有新增无人值守交付保证。
+
+本地构建、全部自动测试、产物语法检查及 git diff --check 通过。新增回归通过实际 pollLoop 验证原用户路由、无识别文字/有识别文字/混合语音、转换后的文字、先保存后提示、重复去重、发送未知继续下一条、保存失败及保存期间停用；既有图片下载失败回归的后续输入改为普通文字。测试模拟微信接口，不代表真实微信端到端成功。
+
+Forge 校验打包 0.3.3，9/9 文件 SHA256 与当前产物一致；安装返回 updated、version 0.3.3、namespace local、enabled true。首次状态查询出现 PROCESS_START_FAILED（Node 启动超时），随后同实例 list_bindings 成功：两组 Bot connected、原配置/绑定说明 ready、credentialStorage sealed，recoveryError/capabilityError/storageWarning 均 null；lastErrorCode 为 TIMEOUT，未据此推断网络或启动超时根因。
+
 ## 0.3.2 纯正文与一次绑定说明（2026-11-07）
 
 用户明确取代先前“来自微信”和逐条 context 方案。src/core.mjs 直接派发 entry.text，不发送前缀、编号或 context；图片附件及语音识别文字保留。绑定说明使用普通 targets.send，Host 在 register.ts 的适配器从已安装插件名生成 sourcePlugin，并沿队列保存；messageSource.ts 生成 [消息来源]“由插件…(plugin_id: …)发送”，messageSourceNote.ts 只在模型 wire 上添加，不写入正文或系统提示词。agentInputQueue.ts 明确同一 Host 元信息驱动 UI“由插件「X」发送”标签。基于固定 v0.1.128 commit 9d62b213c960c63daa46996de8a606965f2f2299 的 8 项契约探针通过，日志在 .logs/v032/contract-probe.log。运行构建证据仍以 .logs/feas/evidence.md 的 asar/tag 对照为限，不用本地 HEAD 替代。未真实联系伙伴或微信。

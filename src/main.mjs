@@ -17,6 +17,7 @@ async function node(method, params = {}, msg) {
   return unwrapNode(response);
 }
 const router = new ReplyRouter({ targets: cindy.targets, tasks: cindy.tasks, readImages: readGrantedImages,
+  beforeDispatch: entry => guides.requireReady(config.bots.find(bot => bot.id === entry.botConfigId)),
   nodeReply: (params, msg) => replyWithImages(node, params, msg), rejectInbound: (requestId, code) => node('reject', { requestId, code }) });
 const store = new StateStore({ fs: request => cindy.fs(request), node });
 const guides = new BindingGuides({ targets: cindy.targets, persist: () => writeConfig(config),
@@ -76,7 +77,7 @@ async function snapshot() {
   catch (err) { capabilityError = { code: err.code ?? 'TARGET_UNAVAILABLE', message: '伙伴列表不可用，仍可停用或删除已有绑定。' }; }
   const bindingGuides = [];
   for (const bot of config.bots) bindingGuides.push(await guides.refresh(bot));
-  return { plugin: { id: 'wechat-companion', name: '微信伙伴', version: '0.3.2' }, config, runtime, companions, bindingGuides, recoveryError, capabilityError, storageWarning: store.lastWarning };
+  return { plugin: { id: 'wechat-companion', name: '微信伙伴', version: '0.3.4' }, config, runtime, companions, bindingGuides, dispatchRetries: router.pendingRetries(), recoveryError, capabilityError, storageWarning: store.lastWarning };
 }
 async function command(action, args = {}, msg) {
   await init();
@@ -138,7 +139,7 @@ channel.onmessage = async ({ data }) => {
 };
 cindy.onHostMessage(async msg => {
   if (msg.type === 'event' && msg.name === 'node-status') {
-    if (msg.state === 'crashed' || msg.state === 'stopped') { restoreWanted = true; activeInstance = null; inboundImages.clear(); }
+    if (msg.state === 'crashed' || msg.state === 'stopped') { restoreWanted = true; activeInstance = null; inboundImages.clear(); router.reset(); }
     if (msg.state === 'starting' && restoreWanted && !booting) void init().catch(() => {});
     return;
   }
@@ -167,7 +168,6 @@ cindy.onHostMessage(async msg => {
       if (imageParts) event.attachments = inboundImages.take(msg.params);
       const bot = config.bots.find(bot => bot.id === event.botConfigId);
       if (!bot?.enabled) fail('BINDING_CHANGED', 'Bot 未启用聊天。');
-      await guides.requireReady(bot);
       await router.receive(event);
     } catch (err) {
       inboundImages.drop(msg.params?.requestId);

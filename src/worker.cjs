@@ -6,6 +6,7 @@ const { sealState, openState } = require('./state.cjs');
 const { imageBytes, MAX_IMAGE_BYTES } = require('./media.cjs');
 const MAX_PENDING_IMAGE_BYTES = 40 * 1024 * 1024;
 const IMAGE_CHUNK_CHARS = 192 * 1024;
+const VOICE_UNSUPPORTED_REPLY = '暂不支持语音，请使用微信语音转文字后发送。';
 const pause = (ms, signal) => new Promise(resolve => {
   if (signal?.aborted) return resolve();
   const done = () => { clearTimeout(timer); signal?.removeEventListener('abort', done); resolve(); };
@@ -173,6 +174,7 @@ class BotManager {
         }
         if (signal.aborted || state.generation !== generation) return;
         for (const event of batch) {
+          if (event.voiceNotice) { await this.sendVoiceNotice(event, signal); continue; }
           try {
             const prepared = await this.prepareInbound(event, signal);
             if (signal.aborted || state.generation !== generation) return;
@@ -206,12 +208,31 @@ class BotManager {
     state.seen.add(message.id); if (state.seen.size > 512) state.seen.delete(state.seen.values().next().value);
     this.requests.set(requestId, entry); state.stats.received++;
     if (message.unsupported || (!message.text.trim() && !message.images.length) || message.text.length > 16000) {
-      state.stats.rejected++; entry.state = 'rejected'; state.lastErrorCode = message.errorCode ?? 'UNSUPPORTED_MESSAGE'; return;
+      state.stats.rejected++; entry.state = 'rejected'; state.lastErrorCode = message.errorCode ?? 'UNSUPPORTED_MESSAGE';
+      this.releaseImages(entry);
+      if (!message.hasVoice) return;
+      const event = { requestId, botConfigId: state.config.id, generation, voiceNotice: true };
+      if (emit) void this.sendVoiceNotice(event, state.abort?.signal);
+      return event;
     }
     const event = { requestId, botConfigId: state.config.id, generation, instanceId: this.instanceId, text: message.text.trim() ? message.text : '请查看微信用户发送的图片。' };
     if (emit && !message.images.length) this.notify('wechat/inbound', event);
     else if (emit) void this.prepareInbound(event, state.abort?.signal).then(prepared => this.notifyInbound(prepared), err => this.reject(requestId, err.code ?? 'IMAGE_DOWNLOAD_FAILED'));
     return event;
+  }
+  async sendVoiceNotice({ requestId, botConfigId, generation }, signal) {
+    const entry = this.requests.get(requestId), state = this.bots.get(botConfigId);
+    const current = () => this.requests.get(requestId) === entry && state?.config.enabled && state.client &&
+      state.generation === generation && entry?.generation === generation && !signal?.aborted;
+    if (!entry?.hasVoice || entry.state !== 'rejected' || entry.noticeAttempted || !current()) return;
+    // The poll loop saves cursor/seen before this one attempt. Never retry an uncertain send.
+    entry.noticeAttempted = true;
+    try {
+      await state.client.send({ peerId: entry.peerId, contextToken: entry.contextToken, clientId: randomUUID(), text: VOICE_UNSUPPORTED_REPLY }, signal);
+      if (current()) state.stats.delivered++;
+    } catch {
+      if (current()) state.lastErrorCode = 'DELIVERY_UNCERTAIN';
+    }
   }
   releaseImages(entry) { this.pendingImageBytes -= entry.mediaBytes ?? 0; entry.mediaBytes = 0; entry.images = []; }
   notifyInbound(event) {
