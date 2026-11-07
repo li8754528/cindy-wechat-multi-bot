@@ -2,6 +2,20 @@
 
 目标宿主：本机 Cindy 0.1.128；源码 tag v0.1.128，commit `9d62b213c960c63daa46996de8a606965f2f2299`。
 
+## 0.3.5 主动发送微信（2026-11-07）
+
+用户从微信给喵喵发新消息后明确要求再次测试。list_bindings 确认喵喵已接收 1 条消息，出现已知联系人和 defaultPeerId，credentialStorage sealed、连接正常。通过同一个 local 实例 send_to_wechat 指定喵喵及该已知联系人，发送注明用途的主动通知测试文字，真实返回 ok:true、delivered:true、chunks:1、images:0；Bot 与联系人回执和所选目标一致，没有调用 reply_to_wechat。此项确认真实微信发送接口成功；未以接口回执推断用户已阅读、真实图片发送或完整重启后的端到端行为。
+
+用户随后明确要求安装并实测。Forge 返回 updated、version 0.3.5、namespace local、instanceId _ns__local__wechat-companion、enabled true。list_bindings 确认运行 0.3.5，瑶瑶和喵喵两组原配置与伙伴绑定保留、connected，credentialStorage sealed，recoveryError/capabilityError/storageWarning 均 null。两组 peers 为空、defaultPeerId 为 null。通过 local 实例 send_to_wechat 向喵喵默认联系人发送注明用途的测试文字，真实返回 WECHAT_PEER_NOT_KNOWN：“没有该微信联系人的发送上下文，请先让对方给这个 Bot 发一条消息。” 本次没有发送到微信；需用户先在微信给该 Bot 发一条新消息建立上下文，随后再做主动发送验收。没有重试、重扫、伪造联系人或迁移内置微信账号。
+
+用户明确指向 Cindy“IM 机器人 → 个人微信”，已实测内置功能可以主动发送。本次只读核对相邻 dev_cindy/cindy 的 WechatIM.sendText，并用 git show 在上述固定 commit 核验同一路径：当前任务 contextToken 不存在时从 WechatTaskStore.getLatestPeerContext 读取已加密保存的上下文；工具 providers.ts 依次选择当前渠道、当前会话或最近联系人。插件的 NO_CURRENT_REQUEST 来自 ReplyRouter.reply 主动拒绝无当前 entry，是回传限制，不是微信协议不支持主动发送。
+
+新增 send_to_wechat，复用现有文字/图片分块和发送回执链路。伙伴按宿主 session_context 与保存的会话映射匹配自身绑定；桌面任务显式选 Bot。Node 只选本 Bot 已知联系人，默认最近联系用户，可指定已有 peer_id；准备阶段固定联系人及连接代次，后续新输入不改投。联系人最新上下文限制为最近 8 位，和登录一起 AES-256-GCM 保存，旧登录格式兼容。暂停保留上下文，换绑、更换账号、断开或凭证失效清除。原回传仍校验当前请求，主动发送不消费微信请求。
+
+修复 main 的工作进程恢复清空会话映射后未恢复说明回执映射的问题。新版说明单独声明主动发送工具；旧完成说明显示“更新伙伴说明”，只有用户操作时发送一次，升级/刷新状态不自动联系伙伴，不阻塞旧说明已完成的普通收发。
+
+构建、101/101 自动测试、生成入口语法检查和 git diff --check 通过。新增源码及编译 main.js 的模拟验收覆盖无当前请求、不同 Bot/伙伴隔离、最新与显式已知联系人、陌生联系人拒绝、旧登录兼容、加密保存/新进程恢复、同/不同微信账号重扫、图片准备期间新联系人/换绑、主动发送不消费输入、同 callId 幂等和未知发送不重试。打包阶段未安装或发送真实微信；后续安装与文字主动发送结果见本节顶部，未发布。发送去重和发送回执只在内存，跨调用或重启不保证去重。
+
 ## 0.3.4 转交伙伴失败后两次延迟重试（2026-11-07）
 
 按用户追加要求，ReplyRouter 保留初次转交失败的原输入，等待 3 分钟重试一次，仍失败则再等 10 分钟重试一次。每次重用 wx-<requestId>、原文字/图片和目标伙伴，依赖宿主同键幂等投递。成功停止重试；同 Bot 保持 lane 顺序，其他 Bot 独立。失败重试耗尽才通知 Node 拒绝并释放图片/占用。授权拒绝、接口不支持、无效请求、请求键冲突及过期不重试；投递不确定同键重试而不换键，仍未知则显示 DISPATCH_DELIVERY_UNCERTAIN。微信端回复发送仍不重试。

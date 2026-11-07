@@ -40,6 +40,8 @@ async function boot() {
 async function bindInstance(state, force = false) {
   if (!force && state.instanceId === activeInstance) return;
   activeInstance = state.instanceId; router.reset(); router.setConfig(config); inboundImages.clear();
+  // Resetting the worker must retain the host-issued companion session mapping.
+  guides.load(guides.serialize(config), config);
   await node('configure', { bots: config.bots });
   try { await ensureVault(fetch); await store.restore(); recoveryError = null; }
   catch (err) { recoveryError = { code: err.code ?? 'PERSISTENCE_FAILED', message: err.code ? err.message : '恢复登录失败，请检查插件设置。' }; }
@@ -77,7 +79,7 @@ async function snapshot() {
   catch (err) { capabilityError = { code: err.code ?? 'TARGET_UNAVAILABLE', message: '伙伴列表不可用，仍可停用或删除已有绑定。' }; }
   const bindingGuides = [];
   for (const bot of config.bots) bindingGuides.push(await guides.refresh(bot));
-  return { plugin: { id: 'wechat-companion', name: '微信伙伴', version: '0.3.4' }, config, runtime, companions, bindingGuides, dispatchRetries: router.pendingRetries(), recoveryError, capabilityError, storageWarning: store.lastWarning };
+  return { plugin: { id: 'wechat-companion', name: '微信伙伴', version: '0.3.5' }, config, runtime, companions, bindingGuides, dispatchRetries: router.pendingRetries(), recoveryError, capabilityError, storageWarning: store.lastWarning };
 }
 async function command(action, args = {}, msg) {
   await init();
@@ -180,6 +182,9 @@ cindy.onHostMessage(async msg => {
     await init(); let result;
     if (msg.tool === 'reply_to_wechat') {
       result = await router.reply(msg.args.request_id, msg.args.text, msg.args.session_context?.session_id, msg, msg.args.attachments);
+    } else if (msg.tool === 'send_to_wechat') {
+      result = await router.send(msg.args, msg.args.session_context?.session_id, msg,
+        (params, context) => node('send/prepare', params, context));
     } else result = await controlled(msg.tool, msg.args, msg);
     const images = result?.qrPngBase64 ? [{ data: result.qrPngBase64 }] : undefined;
     if (images) { const { qrPngBase64, ...metadata } = result; result = metadata; }

@@ -40,6 +40,13 @@ function openState(envelope, secret) {
           row.seen.some(id => typeof id !== 'string' || id.length > 512) || ids.has(row.id) || accountIds.has(row.credentials.botId))
         throw error('STATE_CORRUPT', '保存的登录绑定无效。');
       tencentUrl(row.credentials.baseUrl, true); ids.add(row.id); accountIds.add(row.credentials.botId);
+      // Missing peers is the legacy v1 login format; it remains loadable.
+      if (row.peers !== undefined && (!Array.isArray(row.peers) || row.peers.length > 8 ||
+          new Set(row.peers.map(peer => peer?.peerId)).size !== row.peers.length ||
+          row.peers.some(peer => !peer || typeof peer.peerId !== 'string' || !peer.peerId || peer.peerId.length > 512 ||
+            typeof peer.contextToken !== 'string' || !peer.contextToken || peer.contextToken.length > 8192 ||
+            !Number.isSafeInteger(peer.receivedAt) || peer.receivedAt < 0)))
+        throw error('STATE_CORRUPT', '保存的微信联系人上下文无效。');
     }
     return value.bots;
   } catch (err) { if (err.code === 'VAULT_KEY_INVALID') throw err; throw error('STATE_CORRUPT', '保存的登录记录无法解密；请在插件设置中重新登录。'); }

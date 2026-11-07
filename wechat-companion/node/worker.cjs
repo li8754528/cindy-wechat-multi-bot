@@ -4891,6 +4891,8 @@ var require_state = __commonJS({
           tencentUrl(row.credentials.baseUrl, true);
           ids.add(row.id);
           accountIds.add(row.credentials.botId);
+          if (row.peers !== void 0 && (!Array.isArray(row.peers) || row.peers.length > 8 || new Set(row.peers.map((peer) => peer?.peerId)).size !== row.peers.length || row.peers.some((peer) => !peer || typeof peer.peerId !== "string" || !peer.peerId || peer.peerId.length > 512 || typeof peer.contextToken !== "string" || !peer.contextToken || peer.contextToken.length > 8192 || !Number.isSafeInteger(peer.receivedAt) || peer.receivedAt < 0)))
+            throw error("STATE_CORRUPT", "\u4FDD\u5B58\u7684\u5FAE\u4FE1\u8054\u7CFB\u4EBA\u4E0A\u4E0B\u6587\u65E0\u6548\u3002");
         }
         return value.bots;
       } catch (err) {
@@ -4957,10 +4959,14 @@ var require_worker = __commonJS({
               status: "disconnected",
               seen: /* @__PURE__ */ new Set(),
               stats: { received: 0, delivered: 0, rejected: 0 },
-              cursor: ""
+              cursor: "",
+              peers: /* @__PURE__ */ new Map()
             };
             this.bots.set(config.id, state);
-          } else if (state.config.companionId !== config.companionId || state.config.enabled !== config.enabled) this.stop(state);
+          } else if (state.config.companionId !== config.companionId || state.config.enabled !== config.enabled) {
+            this.stop(state);
+            if (state.config.companionId !== config.companionId) state.peers.clear();
+          }
           state.config = { ...config };
           if (this.mayStart(state)) this.start(state);
           else if (!config.enabled && state.client) state.status = "paused";
@@ -4998,6 +5004,7 @@ var require_worker = __commonJS({
         state.credentials = void 0;
         state.cursor = "";
         state.seen.clear();
+        state.peers.clear();
         state.status = "disconnected";
         return this.publicState(state);
       }
@@ -5029,7 +5036,9 @@ var require_worker = __commonJS({
           instanceId: this.instanceId,
           stats: { ...state.stats },
           lastErrorCode: state.lastErrorCode ?? null,
-          ilinkBotId: state.credentials?.botId ?? null
+          ilinkBotId: state.credentials?.botId ?? null,
+          peers: [...state.peers.values()].map(({ peerId, receivedAt }) => ({ peerId, receivedAt })),
+          defaultPeerId: [...state.peers.keys()].at(-1) ?? null
         };
       }
       status() {
@@ -5042,7 +5051,8 @@ var require_worker = __commonJS({
           companionId: state.config.companionId,
           credentials: state.credentials,
           cursor: state.cursor,
-          seen: [...state.seen].slice(-64)
+          seen: [...state.seen].slice(-64),
+          peers: [...state.peers.values()]
         }));
         return { hasCredentials: !!records.length, envelope: records.length ? sealState(records, secret) : null };
       }
@@ -5055,6 +5065,7 @@ var require_worker = __commonJS({
           state.credentials = record.credentials;
           state.cursor = record.cursor;
           state.seen = new Set(record.seen);
+          state.peers = new Map((record.peers ?? []).map((peer) => [peer.peerId, peer]));
           state.client = this.clientFactory({ token: record.credentials.token, baseUrl: record.credentials.baseUrl });
           state.status = "paused";
           if (state.config.enabled) this.start(state);
@@ -5114,6 +5125,7 @@ var require_worker = __commonJS({
             if (!sameAccount) {
               state.cursor = "";
               state.seen.clear();
+              state.peers.clear();
             }
             state.credentials = { token: result.bot_token, botId: result.ilink_bot_id, userId: result.ilink_user_id, baseUrl: result.baseurl };
             state.client = this.clientFactory({ token: result.bot_token, baseUrl: result.baseurl });
@@ -5183,13 +5195,13 @@ var require_worker = __commonJS({
             if (signal.aborted || state.generation !== generation) return;
             if (result.msgs !== void 0 && (!Array.isArray(result.msgs) || result.msgs.length > 100)) throw error("BAD_RESPONSE", "\u5FAE\u4FE1\u6D88\u606F\u5217\u8868\u65E0\u6548\u6216\u8FC7\u5927\u3002");
             if (result.msgs?.length || failures) state.lastErrorCode = null;
-            const previousCursor = state.cursor, batch = [];
+            const previousCursor = state.cursor, previousPeerRevision = state.peerRevision, batch = [];
             for (const raw of result.msgs ?? []) {
               const event = this.ingest(state, generation, raw, false);
               if (event) batch.push(event);
             }
             if (typeof result.get_updates_buf === "string") state.cursor = result.get_updates_buf;
-            if (batch.length || state.cursor !== previousCursor) {
+            if (batch.length || state.cursor !== previousCursor || state.peerRevision !== previousPeerRevision) {
               try {
                 await this.checkpoint();
               } catch {
@@ -5225,6 +5237,7 @@ var require_worker = __commonJS({
               state.client = void 0;
               state.cursor = "";
               state.seen.clear();
+              state.peers.clear();
               state.status = "needs_login";
               this.notify("wechat/connection-reset", { botConfigId: state.config.id, generation: state.generation, instanceId: this.instanceId });
               try {
@@ -5243,6 +5256,12 @@ var require_worker = __commonJS({
       ingest(state, generation, raw, emit = true) {
         const message = decodeMessage(raw);
         if (!message || state.seen.has(message.id)) return;
+        if (state.generation !== generation || !state.config.enabled) return;
+        if (message.peerId.length > 512 || message.contextToken.length > 8192) throw error("BAD_RESPONSE", "\u5FAE\u4FE1\u8054\u7CFB\u4EBA\u4E0A\u4E0B\u6587\u65E0\u6548\u6216\u8FC7\u5927\u3002");
+        state.peers.delete(message.peerId);
+        state.peers.set(message.peerId, { peerId: message.peerId, contextToken: message.contextToken, receivedAt: Date.now() });
+        state.peerRevision = (state.peerRevision ?? 0) + 1;
+        if (state.peers.size > 8) state.peers.delete(state.peers.keys().next().value);
         for (const [id, entry2] of this.requests) if (Date.now() - entry2.createdAt > 30 * 6e4) {
           this.releaseImages(entry2);
           this.clearStaged(entry2);
@@ -5436,7 +5455,7 @@ var require_worker = __commonJS({
             }
             entry.state = "sent";
             state.stats.delivered++;
-            return { delivered: true, requestId, chunks: chunks.length, images: uploaded.length };
+            return { delivered: true, requestId, botConfigId: entry.botConfigId, peerId: entry.peerId, chunks: chunks.length, images: uploaded.length };
           } catch (err) {
             if (!sendAttempted) {
               entry.state = "rejected";
@@ -5452,6 +5471,38 @@ var require_worker = __commonJS({
           }
         })();
         return entry.replyPromise;
+      }
+      prepareSend({ id, companionId, sendId, peerId }) {
+        const state = this.bot(id);
+        if (!state.config.enabled || state.config.companionId !== companionId || !state.client || !["connected", "reconnecting"].includes(state.status) || state.abort?.signal.aborted)
+          throw error("BOT_NOT_AVAILABLE", "Bot \u672A\u542F\u7528\u6216\u8FDE\u63A5\u4E0D\u53EF\u7528\uFF0C\u8BF7\u5148\u6062\u590D\u804A\u5929\u5E76\u68C0\u67E5\u767B\u5F55\u72B6\u6001\u3002");
+        if (typeof sendId !== "string" || !/^[a-f0-9-]{36}$/.test(sendId) || peerId !== void 0 && (typeof peerId !== "string" || !peerId || peerId.length > 512))
+          throw error("INVALID_REPLY", "\u53D1\u9001\u6807\u8BC6\u6216\u8054\u7CFB\u4EBA\u65E0\u6548\u3002");
+        const requestId = `out-${sendId}`, previous = this.requests.get(requestId);
+        if (previous) {
+          if (previous.botConfigId !== id || previous.generation !== state.generation || previous.selectedPeerId !== peerId)
+            throw error("REPLY_CONFLICT", "\u540C\u4E00\u53D1\u9001\u8C03\u7528\u4E0D\u80FD\u6539\u53D8\u76EE\u6807\u3002");
+          return { requestId, generation: previous.generation };
+        }
+        const peer = state.peers.get(peerId ?? [...state.peers.keys()].at(-1));
+        if (!peer) throw error("WECHAT_PEER_NOT_KNOWN", "\u6CA1\u6709\u8BE5\u5FAE\u4FE1\u8054\u7CFB\u4EBA\u7684\u53D1\u9001\u4E0A\u4E0B\u6587\uFF0C\u8BF7\u5148\u8BA9\u5BF9\u65B9\u7ED9\u8FD9\u4E2A Bot \u53D1\u4E00\u6761\u6D88\u606F\u3002");
+        for (const [key, old] of this.requests) if (Date.now() - old.createdAt > 30 * 6e4 && old.state !== "sending") {
+          this.releaseImages(old);
+          this.clearStaged(old);
+          this.requests.delete(key);
+        }
+        if (this.requests.size >= 256) throw error("INBOX_FULL", "\u7B49\u5F85\u5904\u7406\u7684\u6D88\u606F\u8FC7\u591A\uFF0C\u8BF7\u7A0D\u540E\u53D1\u9001\u3002");
+        this.requests.set(requestId, {
+          ...peer,
+          requestId,
+          botConfigId: id,
+          generation: state.generation,
+          selectedPeerId: peerId,
+          state: "pending",
+          createdAt: Date.now(),
+          images: []
+        });
+        return { requestId, generation: state.generation };
       }
       close() {
         for (const id of this.bots.keys()) this.disconnect(id);
@@ -5534,6 +5585,9 @@ var require_worker = __commonJS({
               break;
             case "reply":
               result = await manager.reply(args);
+              break;
+            case "send/prepare":
+              result = manager.prepareSend(args);
               break;
             case "reply/images/begin":
               result = manager.stageBegin(args);

@@ -121,6 +121,11 @@ function render() {
       }, 'primary');
       else add(actions, '扫码登录', () => beginLogin(bot.id), 'primary');
       add(actions, '编辑 Bot', () => openBinding(bot.id, false));
+      if (guideState === 'ready' && view.bindingGuides?.find(item => item.id === bot.id)?.updateAvailable)
+        add(actions, '更新伙伴说明', async () => {
+          view = await request('prepare_binding', { id: bot.id }); render();
+          notice('已提交新版伙伴说明，包含主动发送微信的用法。');
+        });
       if (['required', 'failed', 'unknown'].includes(guideState)) add(actions, guideState === 'required' ? '发送伙伴说明' : '核实并重试伙伴说明', async () => {
         view = await request('prepare_binding', { id: bot.id, retry: guideState !== 'required' }); render();
         notice('说明回执已更新；只有确认处理完成后才会派发微信消息。并不保证伙伴已写入长期记忆。');

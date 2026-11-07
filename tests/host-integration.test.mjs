@@ -73,6 +73,7 @@ function makeHost(shared) {
           case 'auth/cancel': result = manager.cancelAuth(params.id); break;
           case 'reject': result = manager.reject(params.requestId, params.code); break;
           case 'reply': result = await manager.reply(params); break;
+          case 'send/prepare': result = manager.prepareSend(params); break;
           case 'reply/images/begin': result = manager.stageBegin(params); break;
           case 'reply/images/chunk': result = manager.stageChunk(params); break;
           case 'reply/images/clear': manager.clearStaged(manager.stagedEntry(params)); result = { cleared: true }; break;
@@ -108,6 +109,34 @@ function makeHost(shared) {
   } };
 }
 const binding = { id: 'a', name: 'A', companionId: 'buddy-a', enabled: false };
+
+test('packaged main proactively sends without a current request, including after encrypted restart', async t => {
+  const shared = { config: { bots: [binding] }, key: null, file: null };
+  const first = makeHost(shared); t.after(() => first.manager.close());
+  await first.tool('list_bindings');
+  await first.tool('begin_login', { id: 'a' }); await first.tool('check_login', { id: 'a' });
+  await first.tool('upsert_binding', { id: 'a', name: 'A', companion_id: 'buddy-a', enabled: true });
+  const state = first.manager.bot('a');
+  first.manager.ingest(state, state.generation, { message_id: 700, message_type: 1, from_user_id: 'wechat-peer', context_token: 'private-proactive-context',
+    item_list: [{ type: 1, text_item: { text: 'hello' } }] });
+  await first.drainEvents();
+  const session_context = { session_id: 'session-a' };
+  assert.equal((await first.tool('reply_to_wechat', { text: 'answer', session_context })).ok, true);
+  await first.event('wechat/state-changed', { checkpointId: 'save-peers', instanceId: first.manager.instanceId });
+  assert.equal((await first.tool('reply_to_wechat', { text: 'no current', session_context })).errorCode, 'NO_CURRENT_REQUEST');
+  const sent = await first.tool('send_to_wechat', { text: 'notification', session_context });
+  assert.equal(sent.ok, true); assert.equal(sent.result.peerId, 'wechat-peer');
+  assert.equal(first.deliveries.at(-1).contextToken, 'private-proactive-context');
+  first.manager.close();
+  const second = makeHost(shared); t.after(() => second.manager.close());
+  // No status refresh or new inbound message is needed to rebind the host session.
+  const restored = await second.tool('send_to_wechat', { text: 'after restart', session_context });
+  assert.equal(restored.ok, true, JSON.stringify(restored));
+  assert.equal(second.dispatches.length, 0); assert.equal(second.guideDispatches.length, 0);
+  assert.equal(second.deliveries[0].peerId, 'wechat-peer');
+  assert.equal(second.deliveries[0].contextToken, 'private-proactive-context');
+  assert.equal(shared.file.includes('private-proactive-context'), false);
+});
 
 test('packaged main reports both pending retry stages, preserves Node input and cancels retry on worker stop', async t => {
   for (const stop of [false, true]) {

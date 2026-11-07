@@ -19,8 +19,9 @@ export function validateConfig(value) {
   }) };
 }
 
-// Reply routing uses only the original request and host-stamped session context.
-// No permission to read companion history and no arbitrary recipient input.
+// Replies use the original request and host-stamped session context. Proactive
+// sends have an explicit tool and only use peers already known to the Node worker.
+// Neither path reads companion history.
 const DISPATCH_RETRY_DELAYS = [3 * 60000, 10 * 60000];
 const NON_RETRYABLE_DISPATCH = new Set(['PERMISSION_DENIED', 'UNSUPPORTED_CAPABILITY', 'INVALID_PARAMS',
   'INVALID_INPUT', 'BINDING_CHANGED', 'STALE_CONNECTION', 'REQUEST_EXPIRED', 'REQUEST_KEY_CONFLICT', 'SUPERSEDED']);
@@ -32,7 +33,7 @@ export class ReplyRouter {
     this.tasks = tasks; this.readImages = readImages; this.beforeDispatch = beforeDispatch;
     this.setTimer = setTimer; this.clearTimer = clearTimer; this.now = now;
     this.routes = new Map(); this.requests = new Map(); this.lanes = new Map(); this.current = new Map(); this.generations = new Map();
-    this.bindingSessions = new Map(); this.replyCalls = new Map();
+    this.bindingSessions = new Map(); this.replyCalls = new Map(); this.sendCalls = new Map();
   }
   setConfig(config) {
     const next = new Map(config.bots.map(bot => [bot.id, bot]));
@@ -46,7 +47,7 @@ export class ReplyRouter {
   reset() {
     for (const entry of this.requests.values()) { entry.state = 'cancelled'; entry.finish?.(); }
     this.requests.clear(); this.lanes.clear(); this.current.clear(); this.generations.clear();
-    this.bindingSessions.clear(); this.replyCalls.clear();
+    this.bindingSessions.clear(); this.replyCalls.clear(); this.sendCalls.clear();
   }
   bindSession(botConfigId, companionId, sessionId) {
     if (this.routes.get(botConfigId)?.companionId === companionId && typeof sessionId === 'string' && sessionId)
@@ -223,7 +224,7 @@ export class ReplyRouter {
         requestId = this.current.get(bindings[0].id);
         const current = this.requests.get(requestId);
         if (!current || !['dispatching', 'accepted'].includes(current.state))
-          deny('NO_CURRENT_REQUEST', '这位伙伴没有当前有效的微信请求，不能回传说明、历史或其他对话。');
+          deny('NO_CURRENT_REQUEST', '这位伙伴没有当前有效的微信请求。主人要求主动发送时请用 send_to_wechat；绑定说明和确认不要发到微信。');
         this.rememberReplyCall(callId, { sessionId, requestId });
       }
     } else if (typeof requestId !== 'string' || !requestId) fail('INVALID_REPLY', 'request_id 须省略或使用原请求编号。');
@@ -259,5 +260,37 @@ export class ReplyRouter {
       else { entry.state = error.code === 'IMAGE_UPLOAD_FAILED' ? 'rejected' : 'uncertain'; entry.finish(); }
       throw error;
     }
+  }
+  async send({ id, peer_id: peerId, text = '', attachments = [] }, sessionId, callContext, prepareSend) {
+    if (!sessionId || !callContext?.callId) fail('WRONG_COMPANION', '发送需要宿主校验的会话和工具调用身份。');
+    if (typeof text !== 'string' || text.length > 8000 || !Array.isArray(attachments) || attachments.length > 4 ||
+        attachments.some(ref => typeof ref !== 'string' || !/^[a-f0-9]{64}$/.test(ref)) || (!text.trim() && !attachments.length))
+      fail('INVALID_REPLY', '发送须包含文字或通过顶层 attachments 交接的 1–4 张图片，文字最多 8000 字符。');
+    const key = JSON.stringify([sessionId, id, peerId, text, attachments]);
+    const previous = this.sendCalls.get(callContext.callId);
+    if (previous) {
+      if (previous.key !== key) fail('REPLY_CONFLICT', '同一发送调用不能改变目标或内容。');
+      return previous.promise;
+    }
+    const bound = [...this.routes.values()].filter(bot => {
+      const binding = this.bindingSessions.get(bot.id);
+      return bot.enabled && binding?.companionId === bot.companionId && binding.sessionId === sessionId;
+    });
+    if (bound.length > 1) fail('AMBIGUOUS_REQUEST', '伙伴身份对应多组绑定，不能猜测发送目标。');
+    const bot = id === undefined ? bound[0] : this.routes.get(id);
+    if (!bot?.enabled) fail('BOT_NOT_AVAILABLE', '请用 list_bindings 选择已启用的 Bot，并在桌面任务中指定 id；伙伴可省略 id。');
+    if (bound.length && bound[0].id !== bot.id) fail('WRONG_COMPANION', '伙伴只能主动发送到自己绑定的微信 Bot。');
+    const companionId = bot.companionId;
+    const promise = (async () => {
+      // Pin the known peer and connection before any asynchronous image reads.
+      const request = await prepareSend({ id: bot.id, companionId, sendId: crypto.randomUUID(), ...(peerId !== undefined ? { peerId } : {}) }, callContext);
+      const images = attachments.length ? await this.readImages(attachments) : [];
+      const route = this.routes.get(bot.id);
+      if (!route?.enabled || route.companionId !== companionId) fail('BINDING_CHANGED', '准备消息期间绑定已改变，请重新选择发送目标。');
+      return this.nodeReply({ ...request, text, ...(images.length ? { images } : {}) }, callContext);
+    })();
+    this.sendCalls.set(callContext.callId, { key, promise });
+    if (this.sendCalls.size > 512) this.sendCalls.delete(this.sendCalls.keys().next().value);
+    return promise;
   }
 }

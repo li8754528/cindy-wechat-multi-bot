@@ -43,6 +43,16 @@ test('legacy binding requires explicit preparation; rebind gets a distinct guide
   assert.notEqual(f.sends[0].requestKey, f.sends[1].requestKey); assert.equal(f.sends[1].target.id, 'buddy-b');
 });
 
+test('old ready instructions update only on explicit preparation and explain proactive sends', async () => {
+  const f = fixture(); await f.guide.prepare(bot); await f.guide.requireReady(bot);
+  const old = structuredClone(f.saved); delete old[0].guideVersion;
+  f.guide.load(old, { bots: [bot] });
+  assert.equal((await f.guide.refresh(bot)).updateAvailable, true); assert.equal(f.sends.length, 1);
+  await f.guide.prepare(bot); await f.guide.requireReady(bot); await f.guide.prepare(bot);
+  assert.equal(f.sends.length, 2); assert.equal(f.guide.info(bot).updateAvailable, false);
+  assert.match(f.sends[1].text, /send_to_wechat/); assert.match(f.sends[1].text, /不需要当前请求/);
+});
+
 test('uncertain guide acknowledgement is reconciled with its original key rather than resending on restart', async () => {
   const f = fixture({ sendError: true, acceptedBeforeError: true });
   await assert.rejects(f.guide.prepare(bot), { code: 'GUIDE_STATUS_UNKNOWN' });

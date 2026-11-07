@@ -3,10 +3,10 @@
   "minCindyVersion": "0.1.128",
   "id": "wechat-companion",
   "name": "微信伙伴",
-  "description": "一个插件管理多个微信 Bot，每个固定绑定一个 Cindy 伙伴。支持文字与图片收发；收到语音自动提示先在微信转成文字再发送。登录安全保存，重启自动恢复。",
-  "whenToUse": "配置微信 Bot 与伙伴绑定、扫码登录、查看连接状态，或通过文字与图片回复微信伙伴转交的消息时使用。",
-  "version": "0.3.4",
-  "releaseNotes": "收到语音时直接回复“暂不支持语音，请使用微信语音转文字后发送。”，不转交伙伴。文字与图片转交伙伴失败时，等待 3 分钟重试；仍失败则再等 10 分钟重试，最多重试两次。重试沿用原请求编号与内容，成功即停止，面板显示下一次重试时间。停用、换绑、连接重置或请求过期取消重试；授权拒绝、接口不支持与无效请求不自动重试。微信回复发送结果不确定时仍不重发。保留登录、配置和原有伙伴回传规则。",
+  "description": "一个插件管理多个微信 Bot，每个固定绑定一个 Cindy 伙伴。支持文字与图片收发、按主人要求主动发送通知；收到语音提示先转成文字。登录与联系人上下文安全保存，重启自动恢复。",
+  "whenToUse": "配置微信 Bot 与伙伴绑定、扫码登录、查看连接状态、回传当前微信消息答案，或按主人要求主动向已联系的微信用户发送文字与图片时使用。",
+  "version": "0.3.5",
+  "releaseNotes": "新增 send_to_wechat 主动发送工具，无需当前微信请求，支持文字和图片。伙伴默认使用自己的绑定，桌面任务可指定 Bot；默认发给该 Bot 最近联系的微信用户，也可选择已有联系人。联系人发送上下文随登录加密保存，重启后恢复；换绑伙伴、退出登录或更换微信账号清除上下文。回传工具仍只处理当前请求，无当前请求时提示使用主动发送工具。修复工作进程恢复时丢失伙伴会话映射的问题。保持原有权限与登录格式兼容，未知发送不自动重试。",
   "entry": "main.js",
   "command": "微信伙伴",
   "showTaskPreferences": false,
@@ -48,7 +48,7 @@
       {
         "dir": "manual/getting-started",
         "name": "getting-started",
-        "description": "添加绑定、扫码登录、验证收发，以及仅回传对应微信请求的答案。"
+        "description": "添加绑定、扫码登录、回传当前微信请求，以及主动发送文字与图片。"
       }
     ]
   },
@@ -175,6 +175,19 @@
             "type": "string",
             "description": "仅针对此次微信消息的回复，最多 8000 字符；仅发送图片时可省略"
           }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "send_to_wechat",
+      "description": "主人要求主动发送微信消息、通知或提醒时使用，无需当前微信请求。伙伴可省略 id 使用自身绑定；桌面任务须从 list_bindings 选择并指定 Bot id。默认发送到该 Bot 最近联系的微信用户，peer_id 可从 runtime.bots[].peers 选择已知联系人，不能发送到陌生微信号。text 最多 8000 字符；图片通过 ghost_call 顶层 attachments 交接，最多 4 张 PNG/JPEG/WebP、每张 5 MiB，仅回图可省略 text。绑定说明和确认不要发送；不自动转发对话历史。同一 callId 在进程内幂等，发送未知先检查微信，不自动重试。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "description": "可选 Bot 配置标识；伙伴省略使用自身绑定，桌面任务必须指定" },
+          "peer_id": { "type": "string", "description": "可选已知联系人 ID，从 list_bindings 的 runtime.bots[].peers 选择；省略发给该 Bot 最近联系的用户" },
+          "text": { "type": "string", "description": "主动发送的消息，最多 8000 字符；仅发送图片时可省略" }
         },
         "additionalProperties": false
       }

@@ -14,6 +14,7 @@
 10. 省略 request_id 的回传只按 Host session_context 匹配唯一启用绑定和当前有效 entry，不能指定 Bot 或收件人。成功与拒绝的 implicit callId 绑定在内存中（最多 512 项），重复同一调用不能随队列推进改投；显式 request_id 仍复用原身份、TTL、幂等及发送保护。新的过时调用、缓存被淘汰/重启或同 canonical 的其他轮次无法靠一次说明排除，需 Host turn/input 关联才能硬保证。
 
 11. 转交失败等待 3 分钟重试一次，再失败则等待 10 分钟重试一次；成功取消后续重试，最终失败才通知 Node.reject 并释放 lane 和图片。绑定说明也在每次派发前重新检查；权限拒绝、接口不支持、无效请求及过期不重试。reset/cancel/finish 清重试定时器，旧回调不得派发新绑定。重试不持久化；Node stopped/crashed 立即 reset 路由。snapshot 仅暴露 Bot 标识、重试次数和时间，不暴露消息或凭证。
+12. send_to_wechat 是主动发送入口，不要求、不关闭当前输入请求。Node 先固定该 Bot 的已知 peer/context 与 generation，再复用图片/文字发送。默认最近联系人，陌生联系人拒绝；联系人上下文随登录加密保存，暂停保留，换绑/更换账号/断开清除。Host 会话映射在工作进程恢复后从既有说明回执重建。相同发送 callId 在进程内复用原 Promise，缓存淘汰或重启不保证去重；未知发送不重试。
 
 ## 对称路径矩阵
 

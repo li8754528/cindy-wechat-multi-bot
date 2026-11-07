@@ -26,8 +26,10 @@ class BotManager {
     for (const config of bots) {
       let state = this.bots.get(config.id);
       if (!state) { state = { config: { ...config }, generation: 1, status: 'disconnected', seen: new Set(),
-        stats: { received: 0, delivered: 0, rejected: 0 }, cursor: '' }; this.bots.set(config.id, state); }
-      else if (state.config.companionId !== config.companionId || state.config.enabled !== config.enabled) this.stop(state);
+        stats: { received: 0, delivered: 0, rejected: 0 }, cursor: '', peers: new Map() }; this.bots.set(config.id, state); }
+      else if (state.config.companionId !== config.companionId || state.config.enabled !== config.enabled) {
+        this.stop(state); if (state.config.companionId !== config.companionId) state.peers.clear();
+      }
       state.config = { ...config };
       if (this.mayStart(state)) this.start(state);
       else if (!config.enabled && state.client) state.status = 'paused';
@@ -46,7 +48,7 @@ class BotManager {
     const state = this.bot(id);
     if (state.client?.lifecycle) void state.client.lifecycle('stop', new AbortController().signal).catch(() => {});
     this.stop(state); state.client = undefined; state.credentials = undefined;
-    state.cursor = ''; state.seen.clear(); state.status = 'disconnected'; return this.publicState(state);
+    state.cursor = ''; state.seen.clear(); state.peers.clear(); state.status = 'disconnected'; return this.publicState(state);
   }
   prepareDisconnect(id) {
     const state = this.bot(id); this.stop(state); state.status = 'disconnecting'; return this.publicState(state);
@@ -61,13 +63,15 @@ class BotManager {
   }
   publicState(state) { return { id: state.config.id, status: state.status,
     connected: !!state.client, generation: state.generation, instanceId: this.instanceId, stats: { ...state.stats },
-    lastErrorCode: state.lastErrorCode ?? null, ilinkBotId: state.credentials?.botId ?? null }; }
+    lastErrorCode: state.lastErrorCode ?? null, ilinkBotId: state.credentials?.botId ?? null,
+    peers: [...state.peers.values()].map(({ peerId, receivedAt }) => ({ peerId, receivedAt })),
+    defaultPeerId: [...state.peers.keys()].at(-1) ?? null }; }
   status() { return { instanceId: this.instanceId, bots: [...this.bots.values()].map(state => this.publicState(state)), credentialStorage: this.storageStatus }; }
   seal(secret) {
     if (!this.initialized) throw error('STATE_NOT_READY', '登录记录尚未恢复，不能覆盖已保存的状态。');
     const records = [...this.bots.values()].filter(state => state.credentials && state.status !== 'disconnecting').map(state => ({
       id: state.config.id, companionId: state.config.companionId, credentials: state.credentials,
-      cursor: state.cursor, seen: [...state.seen].slice(-64),
+      cursor: state.cursor, seen: [...state.seen].slice(-64), peers: [...state.peers.values()],
     }));
     return { hasCredentials: !!records.length, envelope: records.length ? sealState(records, secret) : null };
   }
@@ -77,6 +81,7 @@ class BotManager {
       const state = this.bots.get(record.id);
       if (!state || state.config.companionId !== record.companionId) continue;
       this.stop(state); state.credentials = record.credentials; state.cursor = record.cursor; state.seen = new Set(record.seen);
+      state.peers = new Map((record.peers ?? []).map(peer => [peer.peerId, peer]));
       state.client = this.clientFactory({ token: record.credentials.token, baseUrl: record.credentials.baseUrl });
       state.status = 'paused'; if (state.config.enabled) this.start(state);
     }
@@ -119,7 +124,7 @@ class BotManager {
         for (const other of this.bots.values()) if (other !== state && other.credentials?.botId === result.ilink_bot_id)
           throw error('DUPLICATE_BOT_ACCOUNT', '这个微信 Bot 已经登录到另一组配置，请使用不同的 Bot。');
         const sameAccount = state.credentials?.botId === result.ilink_bot_id;
-        this.stop(state); if (!sameAccount) { state.cursor = ''; state.seen.clear(); }
+        this.stop(state); if (!sameAccount) { state.cursor = ''; state.seen.clear(); state.peers.clear(); }
         state.credentials = { token: result.bot_token, botId: result.ilink_bot_id, userId: result.ilink_user_id, baseUrl: result.baseurl };
         state.client = this.clientFactory({ token: result.bot_token, baseUrl: result.baseurl });
         state.auth = undefined; state.status = 'saving_login'; this.storageStatus = 'not-saved';
@@ -164,10 +169,10 @@ class BotManager {
         if (signal.aborted || state.generation !== generation) return;
         if (result.msgs !== undefined && (!Array.isArray(result.msgs) || result.msgs.length > 100)) throw error('BAD_RESPONSE', '微信消息列表无效或过大。');
         if (result.msgs?.length || failures) state.lastErrorCode = null;
-        const previousCursor = state.cursor, batch = [];
+        const previousCursor = state.cursor, previousPeerRevision = state.peerRevision, batch = [];
         for (const raw of result.msgs ?? []) { const event = this.ingest(state, generation, raw, false); if (event) batch.push(event); }
         if (typeof result.get_updates_buf === 'string') state.cursor = result.get_updates_buf;
-        if (batch.length || state.cursor !== previousCursor) {
+        if (batch.length || state.cursor !== previousCursor || state.peerRevision !== previousPeerRevision) {
           try { await this.checkpoint(); } catch {
             state.status = 'storage_error'; state.lastErrorCode = 'PERSISTENCE_FAILED'; return;
           }
@@ -190,7 +195,7 @@ class BotManager {
         if (signal.aborted) return;
         state.lastErrorCode = err.code ?? 'NETWORK_ERROR';
         if (err.code === 'AUTH_EXPIRED') {
-          this.stop(state); state.credentials = undefined; state.client = undefined; state.cursor = ''; state.seen.clear(); state.status = 'needs_login';
+          this.stop(state); state.credentials = undefined; state.client = undefined; state.cursor = ''; state.seen.clear(); state.peers.clear(); state.status = 'needs_login';
           this.notify('wechat/connection-reset', { botConfigId: state.config.id, generation: state.generation, instanceId: this.instanceId });
           try { await this.checkpoint(); } catch { state.lastErrorCode = 'PERSISTENCE_FAILED'; } return;
         }
@@ -200,6 +205,12 @@ class BotManager {
   }
   ingest(state, generation, raw, emit = true) {
     const message = decodeMessage(raw); if (!message || state.seen.has(message.id)) return;
+    if (state.generation !== generation || !state.config.enabled) return;
+    if (message.peerId.length > 512 || message.contextToken.length > 8192) throw error('BAD_RESPONSE', '微信联系人上下文无效或过大。');
+    state.peers.delete(message.peerId);
+    state.peers.set(message.peerId, { peerId: message.peerId, contextToken: message.contextToken, receivedAt: Date.now() });
+    state.peerRevision = (state.peerRevision ?? 0) + 1;
+    if (state.peers.size > 8) state.peers.delete(state.peers.keys().next().value);
     for (const [id, entry] of this.requests) if (Date.now() - entry.createdAt > 30 * 60000) { this.releaseImages(entry); this.clearStaged(entry); this.requests.delete(id); }
     const requestId = randomUUID();
     const entry = { ...message, requestId, botConfigId: state.config.id, generation, state: 'pending', createdAt: Date.now() };
@@ -343,7 +354,7 @@ class BotManager {
         this.notify('wechat/reply-progress', { requestId, instanceId: this.instanceId });
         await state.client.sendImage({ peerId: entry.peerId, contextToken: entry.contextToken, clientId: randomUUID(), image }, signal);
       }
-      entry.state = 'sent'; state.stats.delivered++; return { delivered: true, requestId, chunks: chunks.length, images: uploaded.length };
+      entry.state = 'sent'; state.stats.delivered++; return { delivered: true, requestId, botConfigId: entry.botConfigId, peerId: entry.peerId, chunks: chunks.length, images: uploaded.length };
       } catch (err) {
       if (!sendAttempted) { entry.state = 'rejected'; state.lastErrorCode = err.code ?? 'IMAGE_UPLOAD_FAILED'; throw error('IMAGE_UPLOAD_FAILED', '图片准备或上传失败，尚未发送回复，请让微信用户重新发送请求。'); }
       entry.state = 'uncertain'; state.lastErrorCode = 'DELIVERY_UNCERTAIN';
@@ -351,6 +362,31 @@ class BotManager {
       } finally { this.releaseImages(entry); this.clearStaged(entry); }
     })();
     return entry.replyPromise;
+  }
+  prepareSend({ id, companionId, sendId, peerId }) {
+    const state = this.bot(id);
+    if (!state.config.enabled || state.config.companionId !== companionId || !state.client ||
+        !['connected', 'reconnecting'].includes(state.status) || state.abort?.signal.aborted)
+      throw error('BOT_NOT_AVAILABLE', 'Bot 未启用或连接不可用，请先恢复聊天并检查登录状态。');
+    if (typeof sendId !== 'string' || !/^[a-f0-9-]{36}$/.test(sendId) ||
+        (peerId !== undefined && (typeof peerId !== 'string' || !peerId || peerId.length > 512)))
+      throw error('INVALID_REPLY', '发送标识或联系人无效。');
+    const requestId = `out-${sendId}`, previous = this.requests.get(requestId);
+    if (previous) {
+      if (previous.botConfigId !== id || previous.generation !== state.generation || previous.selectedPeerId !== peerId)
+        throw error('REPLY_CONFLICT', '同一发送调用不能改变目标。');
+      return { requestId, generation: previous.generation };
+    }
+    // Like Cindy personal WeChat, default to the most recently received peer.
+    const peer = state.peers.get(peerId ?? [...state.peers.keys()].at(-1));
+    if (!peer) throw error('WECHAT_PEER_NOT_KNOWN', '没有该微信联系人的发送上下文，请先让对方给这个 Bot 发一条消息。');
+    for (const [key, old] of this.requests) if (Date.now() - old.createdAt > 30 * 60000 && old.state !== 'sending') {
+      this.releaseImages(old); this.clearStaged(old); this.requests.delete(key);
+    }
+    if (this.requests.size >= 256) throw error('INBOX_FULL', '等待处理的消息过多，请稍后发送。');
+    this.requests.set(requestId, { ...peer, requestId, botConfigId: id, generation: state.generation,
+      selectedPeerId: peerId, state: 'pending', createdAt: Date.now(), images: [] });
+    return { requestId, generation: state.generation };
   }
   close() { for (const id of this.bots.keys()) this.disconnect(id); this.bots.clear(); this.requests.clear(); }
 }
@@ -388,6 +424,7 @@ function serve() {
         case 'disconnect/rollback': result = manager.rollbackDisconnect(args.id); break;
         case 'auth/cancel': result = manager.cancelAuth(args.id); break;
         case 'reply': result = await manager.reply(args); break;
+        case 'send/prepare': result = manager.prepareSend(args); break;
         case 'reply/images/begin': result = manager.stageBegin(args); break;
         case 'reply/images/chunk': result = manager.stageChunk(args); break;
         case 'reply/images/clear': { manager.clearStaged(manager.stagedEntry(args)); result = { cleared: true }; break; }
