@@ -23,6 +23,12 @@ test('configuration persists multiple one-to-one bindings and strips credentials
   assert.throws(() => validateConfig({ bots: [bot(), bot('b')] }), { code: 'DUPLICATE_BINDING' });
   assert.throws(() => validateConfig({ bots: [bot(), bot('a', 'buddy-b')] }), { code: 'DUPLICATE_BINDING' });
 });
+test('multiple unpaired QR drafts are allowed but cannot receive before selecting a companion', () => {
+  const drafts = [{ ...bot(), companionId: '', enabled: false }, { ...bot('b'), companionId: '', enabled: false }];
+  assert.equal(validateConfig({ bots: drafts }).bots.length, 2);
+  assert.throws(() => validateConfig({ bots: [{ ...drafts[0], enabled: true }] }), { code: 'INVALID_CONFIG' });
+  assert.throws(() => validateConfig({ bots: [{ ...drafts[0], companionId: ' ' }] }), { code: 'INVALID_CONFIG' });
+});
 test('two Bots dispatch to their respective companions without sharing replies', async () => {
   const { router, sends, replies } = routerFixture();
   await router.receive(inbound('request-a')); await router.receive(inbound('request-b', 'b'));

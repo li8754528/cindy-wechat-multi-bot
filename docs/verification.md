@@ -2,6 +2,38 @@
 
 目标宿主：本机 Cindy 0.1.128；源码 tag v0.1.128，commit `9d62b213c960c63daa46996de8a606965f2f2299`。
 
+## 0.3.2 纯正文与一次绑定说明（2026-11-07）
+
+用户明确取代先前“来自微信”和逐条 context 方案。src/core.mjs 直接派发 entry.text，不发送前缀、编号或 context；图片附件及语音识别文字保留。绑定说明使用普通 targets.send，Host 在 register.ts 的适配器从已安装插件名生成 sourcePlugin，并沿队列保存；messageSource.ts 生成 [消息来源]“由插件…(plugin_id: …)发送”，messageSourceNote.ts 只在模型 wire 上添加，不写入正文或系统提示词。agentInputQueue.ts 明确同一 Host 元信息驱动 UI“由插件「X」发送”标签。基于固定 v0.1.128 commit 9d62b213c960c63daa46996de8a606965f2f2299 的 8 项契约探针通过，日志在 .logs/v032/contract-probe.log。运行构建证据仍以 .logs/feas/evidence.md 的 asar/tag 对照为限，不用本地 HEAD 替代。未真实联系伙伴或微信。
+
+新增 BindingGuides 保存非秘密的原 requestKey/伙伴/会话/阶段到插件 KV，发送前先持久化键；重复保存、改名、暂停恢复与重启不重发，换绑使用新说明。说明本身不创建微信 entry，不带委派，不调用回传；发说明前检查同 Bot 无当前微信请求。旧绑定不在启动或查看时自动联系伙伴，卡片提供“发送伙伴说明”；正常处理中共享等待查询，输入暂存在内存，计时预算一分钟（查询耗时另计），完成后继续派发。缺少/失败/未知或等待超时明确拒绝，用户处理后重发。普通说明回执 completed 仅表示处理轮次完成，不能证明写入长期记忆。投递未知先核实旧键，只有主人显式 retry 且可靠 terminal 失败才开新说明尝试；found:false 时重试仍用原键。
+
+reply_to_wechat 的 request_id 改为可选，Host 签发 session_context 匹配唯一启用绑定与当前有效请求，无候选/无当前/歧义/过期拒绝。原显式编号、session 身份、每 Bot lane、settled、TTL、图片及发送幂等保留；同一 callId 锁定原请求或拒绝结果，避免配置说明调用被重试后改投新消息。缓存只在内存且有上限，不同 callId 的过时调用及 canonical 桌面轮次仍可误用推进后的当前请求；一次说明不能构成 turn 身份或自动镜像硬保证。
+
+新增回归涵盖纯文无 context、说明仅一次/换绑/重启、未知投递对账、失败显式恢复、配置说明无当前不能回传、busy 禁止插入说明、伙伴身份唯一/歧义、旧编号及 implicit callId 幂等。真实折叠取消后的界面、宿主插件来源标记与模型处理、伙伴记忆遵从、普通说明的真实终态和文字/图片/语音微信端到端仍待 reviewer/实机验收；这里只进行模拟、源码核对与打包。
+
+npm run build、npm test（81/81）、npm run check、git diff --check 通过，完整输出在 .logs/v032/。Forge 校验生成 wechat-companion/wechat-companion-0.3.2.cindy，包内 9/9 SHA256 与当前源码一致。Git 只读确认 main 和既有 origin，日志/缓存/研究数据/包不纳入公开源码；公开排除建议在 .logs/v032/public-exclusion.md。未安装、未发布、未真实联系伙伴或微信，未提交或推送。
+
+## 插件内输入与回执收口（0.3.0 历史，2026-11-07）
+
+沿用 `.logs/feas/evidence.md` 的只读可行性结论：运行构建的 sourceCommit 未能在公开仓库核实，已安装 asar 的关键接口与上述公开 tag 一致；未以本地 HEAD 代替运行版本。本次仅修改插件，不修改宿主、不新增权限、不读取伙伴历史、不安装或发送真实微信。公开 targets.get 只提供关联完成状态与 outputMessageId，不提供答案正文，will-assistant-message 不覆盖伙伴 source=bot，因此本次没有自动回复镜像。
+
+dispatch 探测 tasks.capabilities().messageContext===true：支持时可见 text 严格为“来自微信：”加收到的原文，request_id、必要的 reply_to_wechat 步骤和图片规则进入 context；不支持或文字能力查询失败时保留可见说明。图片能力不足仍拒绝交接，不静默丢图；语音转文字、图片分块与凭证行为保持。
+
+仅同时支持 receiptQuery、settled 和 targets.get 才开始按原 requestKey 查询，并核对目标、会话和已有 executionId。已结算且仍 accepted、replyKey 未预留时标记 settled，finish 释放 lane，再通知 Node 拒绝旧请求；按可靠 outcome 区分完成未回传、失败、取消与中断，缺少或未知 outcome 使用中性的 ENDED_WITHOUT_REPLY，不计微信发送成功。这些是请求级提示，不修改连接状态或建议重扫。图片读取前同步预留 replyKey，正常读取、上传/发送与未知发送回执不被完成查询取消。取消、重置或更换请求后迟到查询失效。权限拒绝停止查询；缺能力、未知完成或查询错误均不重投、不伪造成功，保留 TTL。
+
+本地 npm run build、npm test（72/72）、npm run check 已通过，完整输出位于 `.logs/input-receipt/`。新增定向测试覆盖严格正文/context、能力回退、完成释放/迟到拒绝、错误/未知及关联不符的回执、查询与发送竞态、图片读取成功/失败、发送未知后的幂等、取消后的迟到查询、TTL 与两 Bot 隔离。编译 main.js 模拟宿主还验证 session_context 身份、图片 RPC 限制，以及桌面 will-assistant-message/did-turn 事件与完成回执不会触发微信发送。测试中显式禁止 companions.reply/history。工作区同时存在管理界面并行改动，门禁针对当时合并后的工作树执行；本节不代表其独立 UI 验收。
+
+独立 reviewer 在 `.logs/reviewer-feature/review.md` 确认核心门禁 72/72，并指出未回传错误缺少 UI 映射导致连接误报。本次修复按 outcome 分码并增加请求级提示，沿用 Node 已有的 lastErrorCode 传递，不改变 connected/status；手册区分 REQUEST_SETTLED、REQUEST_EXPIRED 和竞态可能的 DELIVERY_UNCERTAIN。此前实施报告“13 项 router 测试”不准确，原文件实际为 12 个 test 块，本次扩展其中一个 outcome 回归，仍保持 12 块；另补 1 个宿主到 Node 状态到实际 settings.js 卡片渲染的回归，不为测试数凑项。
+
+修复后 npm run build、npm test（73/73）、npm run check、router 定向测试（12/12）、git diff --check 与重新 Forge pack 均通过。新包仍为 `wechat-companion/wechat-companion-0.3.0.cindy`，9/9 文件 SHA256 与当前源码一致；完整输出在 `.logs/input-receipt-fix/`。卡片回归执行真实编译后的 settings.js render 函数，DOM 为模拟，未宣称真实视觉或微信端到端通过。后续独立 reviewer 复验待 Lead 安排。
+
+Forge 校验并生成 `wechat-companion/wechat-companion-0.3.0.cindy`，包内 9/9 个文件 SHA256 与当前源码一致（pack.log、package-identity.log）。打包不安装；本次没有安装、发布、提交或发送真实微信。
+
+残余窗口：首次 1 秒，随后查询结束后等 5 秒，再每次等 15 秒；查询耗时或失败会扩大窗口，权限拒绝时退回 TTL。伙伴 canonical 会话与桌面共用；完成被查询观察到之前，同一伙伴桌面轮次若误用仍有效的旧 request_id，仍可能通过会话级身份校验。插件不会自动监听/镜像桌面输出，但不能声称杜绝所有误用旧编号；彻底解决需要宿主提供 turn/input 级关联。
+
+待真实验收：0.1.128 中折叠附带资料的显示、模型是否读取资料并在本轮结束前调用 reply_to_wechat、真实完成结算时序、扫码后文字/图片/微信语音文字端到端，以及与伙伴桌面交谈交错的行为。真实运行、明暗主题和手机显示不能由模拟测试替代；后续由 Lead 安排 reviewer 验收，当前尚未安装本次构建。
+
 ## 0.2.0 图片与语音文字（2026-11-07）
 
 本次运行通过 check_app_update 核对当前版本 0.1.128，通过 GitHub get_tag 核实正式 tag 指向上述完整 commit；本地 Cindy 仓库提供该 commit 的接口实现。协议参考腾讯官方 openclaw-weixin v2.4.6 / commit `cef0bfc390393f716903e16d50408118047f87e0` 的消息类型、图片发送、CDN 上传及 inbound 语音文字处理。

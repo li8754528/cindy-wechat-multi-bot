@@ -2,6 +2,7 @@ import { ReplyRouter, validateConfig, fail } from './core.mjs';
 import { StateStore, ensureVault, unwrapNode } from './persistence.mjs';
 import { readGrantedImages } from './handoff.mjs';
 import { InboundImages, replyWithImages } from './transfer.mjs';
+import { BindingGuides } from './binding-guides.mjs';
 const inboundImages = new InboundImages();
 const channel = new BroadcastChannel('wechat-companion-control-v1');
 let config = { schemaVersion: 1, bots: [] };
@@ -18,6 +19,13 @@ async function node(method, params = {}, msg) {
 const router = new ReplyRouter({ targets: cindy.targets, tasks: cindy.tasks, readImages: readGrantedImages,
   nodeReply: (params, msg) => replyWithImages(node, params, msg), rejectInbound: (requestId, code) => node('reject', { requestId, code }) });
 const store = new StateStore({ fs: request => cindy.fs(request), node });
+const guides = new BindingGuides({ targets: cindy.targets, persist: () => writeConfig(config),
+  bindSession: (...args) => router.bindSession(...args),
+  assertIdle: bot => { if (router.current.has(bot.id)) fail('GUIDE_BUSY', '请等当前微信请求结束，再发送伙伴说明。'); } });
+async function writeConfig(next) {
+  const response = await fetch('/kv', { method: 'PUT', body: JSON.stringify({ ...next, bindingGuides: guides.serialize(next) }) });
+  if (!response.ok) fail('CONFIG_SAVE_FAILED', '配置或伙伴说明回执保存失败，请刷新状态。');
+}
 async function targetsReady() {
   if (typeof cindy.targets?.capabilities !== 'function') fail('UNSUPPORTED_CAPABILITY', '当前 Cindy 不支持指定伙伴，请更新宿主。');
   const caps = await cindy.targets.capabilities({});
@@ -25,7 +33,7 @@ async function targetsReady() {
 }
 async function boot() {
   const response = await fetch('/kv'); if (!response.ok) fail('CONFIG_READ_FAILED', '无法读取插件配置。');
-  config = validateConfig(await response.json()); router.reset(); router.setConfig(config);
+  const saved = await response.json(); config = validateConfig(saved); router.reset(); router.setConfig(config); guides.load(saved.bindingGuides, config);
   const configured = await node('configure', { bots: config.bots }); await bindInstance(configured, true);
 }
 async function bindInstance(state, force = false) {
@@ -42,20 +50,22 @@ async function init() {
   }
   await startup;
 }
-async function save(next) {
+async function save(next, prepareIds = []) {
   next = validateConfig(next);
   if (next.bots.some(bot => bot.enabled)) await targetsReady();
   for (const bot of next.bots.filter(bot => bot.enabled)) await cindy.targets.resolve({ target: { kind: 'bot', id: bot.companionId } });
-  const response = await fetch('/kv', { method: 'PUT', body: JSON.stringify(next) });
-  if (!response.ok) fail('CONFIG_SAVE_FAILED', '配置保存失败，请稍后重试。');
+  await writeConfig(next);
   for (const bot of config.bots) {
     const replacement = next.bots.find(item => item.id === bot.id);
     if (!replacement?.enabled || replacement.companionId !== bot.companionId) inboundImages.clear(bot.id);
   }
   config = next; router.setConfig(config); const applied = await node('configure', { bots: config.bots }); await bindInstance(applied);
+  for (const [id, record] of guides.records) if (!config.bots.some(bot => bot.id === id && bot.companionId === record.companionId)) guides.records.delete(id);
   if (recoveryError && !config.bots.length) { await store.clear(); await node('state/initialize'); }
   else if (recoveryError) return snapshot();
   await ensureVault(fetch); await store.flush(); recoveryError = null;
+  for (const id of prepareIds) { const bot = config.bots.find(bot => bot.id === id);
+    if (bot?.companionId && !router.current.has(bot.id)) try { await guides.prepare(bot); } catch { /* Saved binding remains; card offers explicit recovery. */ } }
   return snapshot();
 }
 async function snapshot() {
@@ -64,17 +74,31 @@ async function snapshot() {
   let companions = [], capabilityError = null;
   try { companions = (await cindy.targets.list({ targetKind: 'bot' })).targets; }
   catch (err) { capabilityError = { code: err.code ?? 'TARGET_UNAVAILABLE', message: '伙伴列表不可用，仍可停用或删除已有绑定。' }; }
-  return { plugin: { id: 'wechat-companion', name: '微信伙伴', version: '0.2.0' }, config, runtime, companions, recoveryError, capabilityError, storageWarning: store.lastWarning };
+  const bindingGuides = [];
+  for (const bot of config.bots) bindingGuides.push(await guides.refresh(bot));
+  return { plugin: { id: 'wechat-companion', name: '微信伙伴', version: '0.3.2' }, config, runtime, companions, bindingGuides, recoveryError, capabilityError, storageWarning: store.lastWarning };
 }
 async function command(action, args = {}, msg) {
   await init();
   switch (action) {
     case 'list_bindings': return snapshot();
-    case 'save_config': return save(args);
+    case 'save_config': return save(args, args.bots?.filter(bot => bot.companionId).map(bot => bot.id));
+    case 'prepare_binding': {
+      const bot = config.bots.find(bot => bot.id === args.id);
+      if (!bot) fail('BOT_NOT_FOUND', '请先选择一组已保存的 Bot。');
+      await guides.prepare(bot, args.retry === true); return snapshot();
+    }
+    case 'add_bot': {
+      if (config.bots.length >= 32) fail('INVALID_CONFIG', '最多添加 32 个 Bot，请先删除不再使用的 Bot。');
+      let index = 1;
+      while (config.bots.some(bot => bot.name === `微信 Bot ${index}`)) index++;
+      const bot = { id: crypto.randomUUID(), name: `微信 Bot ${index}`, companionId: '', enabled: false };
+      return { ...await save({ bots: [...config.bots, bot] }), addedBotId: bot.id };
+    }
     case 'upsert_binding': {
       const previous = config.bots.find(bot => bot.id === args.id);
       const bot = { id: args.id, name: args.name, companionId: args.companion_id, enabled: args.enabled ?? previous?.enabled ?? false };
-      return save({ bots: [...config.bots.filter(item => item.id !== bot.id), bot] });
+      return save({ bots: [...config.bots.filter(item => item.id !== bot.id), bot] }, [bot.id]);
     }
     case 'delete_binding': return save({ bots: config.bots.filter(bot => bot.id !== args.id) });
     case 'begin_login': {
@@ -104,7 +128,7 @@ function controlled(action, args, msg) {
 }
 channel.onmessage = async ({ data }) => {
   if (data?.type !== 'ui-request' || typeof data.id !== 'string') return;
-  if (!['list_bindings', 'save_config', 'begin_login', 'check_login', 'disconnect_bot', 'cancel_login', 'retry_save'].includes(data.action)) return;
+  if (!['list_bindings', 'save_config', 'prepare_binding', 'add_bot', 'upsert_binding', 'delete_binding', 'begin_login', 'check_login', 'disconnect_bot', 'cancel_login', 'retry_save'].includes(data.action)) return;
   if (!uiCalls.has(data.id)) {
     const pending = controlled(data.action, data.args).then(result => ({ ok: true, result }),
       error => ({ ok: false, code: error.code ?? 'PLUGIN_FAILED', message: error.code ? error.message : '插件请求失败，请稍后重试。' }));
@@ -141,6 +165,9 @@ cindy.onHostMessage(async msg => {
       await init();
       const { imageParts, ...event } = msg.params;
       if (imageParts) event.attachments = inboundImages.take(msg.params);
+      const bot = config.bots.find(bot => bot.id === event.botConfigId);
+      if (!bot?.enabled) fail('BINDING_CHANGED', 'Bot 未启用聊天。');
+      await guides.requireReady(bot);
       await router.receive(event);
     } catch (err) {
       inboundImages.drop(msg.params?.requestId);

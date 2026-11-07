@@ -1,15 +1,67 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/settings.css"><title>微信伙伴</title></head>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="/settings.css">
+  <title>微信伙伴</title>
+</head>
 <body>
-<p>每个微信 Bot 固定对应一个伙伴。支持文字、图片收发和微信语音转文字；登录安全保存，重启后自动恢复。</p>
-<div id="notice" role="status" aria-live="polite">正在读取配置…</div>
-<form id="binding-form">
-<input id="binding-id" type="hidden">
-<label>Bot 名称<input id="binding-name" maxlength="60" required placeholder="例如：家人的个人助理"></label>
-<label>绑定伙伴<select id="companion" required></select></label>
-<label class="inline"><input id="enabled" type="checkbox">启用这组收发</label>
-<div class="actions"><button type="submit">保存绑定</button><button type="button" id="reset-form">清空表单</button><button type="button" id="refresh">刷新状态</button><button type="button" id="retry-save">重试保存登录</button></div>
-</form>
-<div id="bots"></div>
-<section id="login" hidden><p id="login-status"></p><img id="qr" alt="微信 Bot 登录二维码"><button type="button" id="cancel-login">取消本次登录</button></section>
-<script src="/settings.js"></script></body></html>
+<main>
+  <div class="intro">
+    <p>让每个微信 Bot，都有自己的伙伴。</p>
+    <p class="muted">扫码登录，选择伙伴，就能在微信聊天。支持多个 Bot，登录后重启自动恢复。</p>
+  </div>
+  <div class="section-heading">
+    <div><h1>我的 Bot</h1><p id="fleet-summary" class="muted">正在读取状态…</p></div>
+    <div class="actions">
+      <button id="refresh" type="button">刷新状态</button>
+      <button id="add-bot" type="button" class="primary" disabled>＋ 新增 Bot</button>
+    </div>
+  </div>
+  <div id="notice" role="status" aria-live="polite" hidden></div>
+  <div id="recovery" class="recovery" hidden>
+    <p id="recovery-message"></p><button id="retry-save" type="button">重试保存登录</button>
+  </div>
+  <section id="editor" class="editor" aria-labelledby="editor-title" hidden>
+    <div class="section-heading">
+      <h2 id="editor-title">新增 Bot</h2>
+      <button id="close-editor" type="button">取消新增</button>
+    </div>
+    <ol id="setup-steps" class="steps" aria-label="新增步骤">
+      <li id="step-login"><span>1</span> 扫码登录</li>
+      <li id="step-partner"><span>2</span> 选择伙伴</li>
+    </ol>
+    <div id="login" hidden>
+      <div class="qr-frame"><img id="qr" alt="微信 Bot 登录二维码" hidden><p id="qr-placeholder">正在生成二维码…</p></div>
+      <p id="login-status" role="status" aria-live="polite"></p>
+      <p id="login-help" class="muted">用微信扫一扫，再在手机上确认登录。成功后即可选择伙伴。</p>
+      <button id="renew-qr" type="button" hidden>重新生成二维码</button>
+    </div>
+    <form id="binding-form" hidden>
+      <p id="binding-intro" class="muted"></p>
+      <label for="binding-name">Bot 名称</label>
+      <input id="binding-name" maxlength="60" required placeholder="例如：家人的个人助理">
+      <div class="section-heading partner-heading"><h3>选择回答伙伴</h3><button id="refresh-partners" type="button">刷新伙伴</button></div>
+      <div id="partners" class="partners" role="radiogroup" aria-label="选择回答伙伴"></div>
+      <p id="partner-hint" class="muted"></p>
+      <div class="actions"><button id="save-binding" type="submit" class="primary">开始聊天</button></div>
+    </form>
+  </section>
+  <div id="empty-state" class="empty-state" hidden>
+    <div class="empty-symbol" aria-hidden="true">＋</div>
+    <h2>添加你的第一个微信 Bot</h2>
+    <p class="muted">点击“新增 Bot”，扫码后选一位伙伴，剩下的交给 Cindy。</p>
+    <button id="empty-add" type="button" class="primary">＋ 新增 Bot</button>
+  </div>
+  <div id="bots" class="bots" aria-label="微信 Bot 列表"></div>
+  <details class="help">
+    <summary>使用说明</summary>
+    <p>每个 Bot 绑定一位不同的伙伴，回答沿用伙伴自己的模型和权限。支持文字、图片和微信语音转文字。</p>
+    <p>“暂停聊天”会保留登录，“退出登录”会清除这个 Bot 的登录记录。电脑保持 Cindy 运行并联网，即可接收消息。</p>
+    <p>同一个微信 Bot 只能连接一处。已在 Cindy 内置微信或其他地方连接的 Bot，请先解绑，或换一个 Bot 扫码。</p>
+  </details>
+</main>
+<script src="/settings.js"></script>
+</body>
+</html>
