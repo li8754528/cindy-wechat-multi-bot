@@ -3,6 +3,12 @@ let view = { config: { bots: [] }, runtime: { bots: [] }, companions: [] }, logi
 const $ = id => document.getElementById(id);
 const labels = { disconnected: '未登录', waiting_scan: '等待扫码', scanned: '已扫码，等待确认', connected: '已连接',
   paused: '已登录，收发停用', qr_expired: '二维码已过期', error: '连接出错', reconnecting: '正在重连', needs_login: '请重新登录', login_requires_action: '需要微信侧处理', storage_error: '保存失败，请检查存储权限', saving_login: '正在安全保存登录', disconnecting: '正在清理保存的登录' };
+const messageErrors = { VOICE_TRANSCRIPT_MISSING: '微信未返回语音识别文字，请重新发语音或改发文字',
+  TOO_MANY_IMAGES: '单条最多 4 张图片，请分开发送', MEDIA_INBOX_FULL: '等待处理的图片过多，请稍后重发',
+  INVALID_IMAGE: '图片无效或解密失败，请重发 PNG/JPEG/WebP 图片', IMAGE_TOO_LARGE: '图片超过 5 MiB，请压缩后重发',
+  IMAGE_UPLOAD_FAILED: '图片上传失败，尚未发送回复，请重新发送请求', IMAGE_DOWNLOAD_FAILED: '图片下载失败，请重新发送图片',
+  MEDIA_NETWORK_ERROR: '图片传输中断，请检查网络后重发', MEDIA_HTTP_ERROR: '微信图片接口出错，请稍后重发',
+  DELIVERY_UNCERTAIN: '回复发送结果不确定，请在微信检查，不能自动重发', UNSUPPORTED_MESSAGE: '消息包含不支持的内容，请改发文字或图片' };
 channel.onmessage = ({ data }) => {
   if (data?.type !== 'ui-response') return; const item = pending.get(data.id); if (!item) return;
   clearInterval(item.resend); clearTimeout(item.timeout); pending.delete(data.id);
@@ -35,6 +41,7 @@ function render() {
     const box = element('div', '', 'bot'); box.append(element('strong', bot.name));
     box.append(element('p', `伙伴：${companion?.label ?? '伙伴不可用'} · ${labels[state?.status] ?? state?.status ?? '未登录'}`, 'meta'));
     box.append(element('p', `收到 ${state?.stats?.received ?? 0} · 回传 ${state?.stats?.delivered ?? 0}${state?.lastErrorCode ? ` · ${state.lastErrorCode}` : ''}`, 'meta'));
+    if (messageErrors[state?.lastErrorCode]) box.append(element('p', messageErrors[state.lastErrorCode], 'meta'));
     const actions = element('div', '', 'actions');
     const add = (name, handler) => { const button = element('button', name); button.type = 'button'; button.onclick = async () => {
       button.disabled = true; try { await run(() => handler(button)); } finally { button.disabled = false; }

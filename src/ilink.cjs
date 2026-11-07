@@ -1,5 +1,6 @@
 const { randomBytes } = require('node:crypto');
-const VERSION = '0.1.3';
+const { MAX_IMAGE_BYTES, CDN_ORIGIN, imageExtension, readBounded, prepareImage, decryptImage } = require('./media.cjs');
+const VERSION = '0.2.0';
 const AUTH_ORIGIN = 'https://ilinkai.weixin.qq.com';
 function error(code, message) { return Object.assign(new Error(message), { code }); }
 function tencentUrl(value, originOnly = false) {
@@ -45,13 +46,55 @@ class IlinkClient {
     try { return await this.request(`ilink/bot/get_qrcode_status?${new URLSearchParams({ qrcode: qrCode })}`, { authenticated: false, signal }); }
     catch (err) { if (err.code === 'TIMEOUT') return { status: 'wait' }; throw err; }
   }
-  baseInfo() { return { channel_version: VERSION, bot_agent: 'CindyWechatCompanion/0.1.3' }; }
+  baseInfo() { return { channel_version: VERSION, bot_agent: `CindyWechatCompanion/${VERSION}` }; }
   lifecycle(action, signal) { return this.request(`ilink/bot/msg/notify${action}`, { body: { base_info: this.baseInfo() }, signal, timeout: 5000 }); }
   updates(cursor, signal) { return this.request('ilink/bot/getupdates', { body: { get_updates_buf: cursor, base_info: this.baseInfo() }, signal }); }
   send({ peerId, contextToken, clientId, text }, signal) {
     return this.request('ilink/bot/sendmessage', { signal, body: { base_info: this.baseInfo(), msg: {
       from_user_id: '', to_user_id: peerId, client_id: clientId, message_type: 2, message_state: 2,
       item_list: [{ type: 1, text_item: { text } }], context_token: contextToken } } });
+  }
+  async cdn(url, init, signal) {
+    const deadline = AbortSignal.timeout(20000);
+    try {
+      const response = await this.fetch(tencentUrl(url), { ...init, redirect: 'manual', signal: signal ? AbortSignal.any([signal, deadline]) : deadline });
+      if (!response.ok) throw error('MEDIA_HTTP_ERROR', `微信图片接口返回 HTTP ${response.status}。`);
+      return response;
+    } catch (err) { if (err.code) throw err; throw error(signal?.aborted ? 'CANCELLED' : 'MEDIA_NETWORK_ERROR', '微信图片传输中断，请检查连接。'); }
+  }
+  async downloadImage(item, signal) {
+    const media = item.media; let url;
+    if (typeof media?.full_url === 'string' && media.full_url) url = tencentUrl(media.full_url);
+    else {
+      if (typeof media?.encrypt_query_param !== 'string' || !media.encrypt_query_param || media.encrypt_query_param.length > 8192)
+        throw error('INVALID_IMAGE', '微信图片缺少下载信息。');
+      url = new URL('/c2c/download', CDN_ORIGIN); url.searchParams.set('encrypted_query_param', media.encrypt_query_param);
+    }
+    const response = await this.cdn(url, { method: 'GET' }, signal);
+    const bytes = decryptImage(await readBounded(response, MAX_IMAGE_BYTES + 16), item);
+    return { base64: bytes.toString('base64'), name: `wechat-image.${imageExtension(bytes)}` };
+  }
+  async uploadImage(peerId, bytes, signal) {
+    const prepared = prepareImage(bytes);
+    const result = await this.request('ilink/bot/getuploadurl', { signal, timeout: 15000, body: {
+      filekey: prepared.fileKey, media_type: 1, to_user_id: peerId, rawsize: bytes.length, rawfilemd5: prepared.md5,
+      filesize: prepared.ciphertext.length, no_need_thumb: true, aeskey: prepared.keyHex, base_info: this.baseInfo() } });
+    let url;
+    if (typeof result.upload_full_url === 'string' && result.upload_full_url.trim()) url = tencentUrl(result.upload_full_url);
+    else {
+      if (typeof result.upload_param !== 'string' || !result.upload_param || result.upload_param.length > 8192)
+        throw error('INVALID_IMAGE', '微信未返回图片上传地址。');
+      url = new URL('/c2c/upload', CDN_ORIGIN); url.searchParams.set('encrypted_query_param', result.upload_param); url.searchParams.set('filekey', prepared.fileKey);
+    }
+    const response = await this.cdn(url, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: prepared.ciphertext }, signal);
+    const query = response.headers.get('x-encrypted-param'); await response.body?.cancel();
+    if (response.status !== 200 || !query || query.length > 8192) throw error('INVALID_IMAGE', '微信图片上传回执不完整。');
+    return { media: { encrypt_query_param: query, aes_key: Buffer.from(prepared.keyHex).toString('base64'), encrypt_type: 1 }, mid_size: prepared.ciphertext.length };
+  }
+  sendImage({ peerId, contextToken, clientId, image }, signal) {
+    return this.request('ilink/bot/sendmessage', { signal, body: { base_info: this.baseInfo(), msg: {
+      from_user_id: '', to_user_id: peerId, client_id: clientId, message_type: 2, message_state: 2,
+      item_list: [{ type: 2, image_item: image }], context_token: contextToken } } });
   }
 }
 function decodeMessage(message) {
@@ -64,8 +107,17 @@ function decodeMessage(message) {
       typeof message.context_token !== 'string' || !message.context_token) return null;
   const items = Array.isArray(message.item_list) ? message.item_list : [];
   if (items.length > 20) throw error('BAD_RESPONSE', '单条微信消息包含过多内容。');
-  const unsupported = items.some(item => item?.type !== 1);
-  const text = items.filter(item => item?.type === 1 && typeof item.text_item?.text === 'string').map(item => item.text_item.text).join('\n');
-  return { id, text, unsupported, peerId: message.from_user_id, contextToken: message.context_token };
+  let unsupported = false, errorCode; const parts = [], images = [];
+  for (const item of items) {
+    if (item?.type === 1 && typeof item.text_item?.text === 'string') parts.push(item.text_item.text);
+    else if (item?.type === 2 && item.image_item?.media && (item.image_item.media.full_url || item.image_item.media.encrypt_query_param)) images.push(item.image_item);
+    else if (item?.type === 3) {
+      if (typeof item.voice_item?.text === 'string' && item.voice_item.text.trim()) parts.push(`[微信语音转文字]\n${item.voice_item.text}`);
+      else { unsupported = true; errorCode = 'VOICE_TRANSCRIPT_MISSING'; }
+    } else unsupported = true;
+  }
+  if (images.length > 4) { unsupported = true; errorCode = 'TOO_MANY_IMAGES'; }
+  const text = parts.join('\n');
+  return { id, text, images, unsupported, errorCode, peerId: message.from_user_id, contextToken: message.context_token };
 }
 module.exports = { IlinkClient, decodeMessage, tencentUrl, error, AUTH_ORIGIN };

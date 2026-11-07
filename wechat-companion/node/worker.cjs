@@ -4536,11 +4536,93 @@ var require_lib = __commonJS({
   }
 });
 
+// src/media.cjs
+var require_media = __commonJS({
+  "src/media.cjs"(exports2, module2) {
+    var { createCipheriv, createDecipheriv, createHash, randomBytes } = require("node:crypto");
+    var MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+    var CDN_ORIGIN = "https://novac2c.cdn.weixin.qq.com";
+    var error = (code, message) => Object.assign(new Error(message), { code });
+    function imageExtension(bytes) {
+      if (bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return "png";
+      if (bytes.length >= 3 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255) return "jpg";
+      if (bytes.length >= 12 && bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP") return "webp";
+      throw error("INVALID_IMAGE", "\u4EC5\u652F\u6301 PNG\u3001JPEG \u6216 WebP \u56FE\u7247\u3002");
+    }
+    function imageBytes(base64) {
+      if (typeof base64 !== "string" || !base64 || base64.length > Math.ceil(MAX_IMAGE_BYTES / 3) * 4)
+        throw error("INVALID_IMAGE", "\u6BCF\u5F20\u56FE\u7247\u987B\u4E3A 1 \u5B57\u8282\u81F3 5 MiB\u3002");
+      const bytes = Buffer.from(base64, "base64");
+      if (!bytes.length || bytes.length > MAX_IMAGE_BYTES || bytes.toString("base64") !== base64)
+        throw error("INVALID_IMAGE", "\u56FE\u7247\u6570\u636E\u65E0\u6548\u6216\u8D85\u8FC7 5 MiB\u3002");
+      imageExtension(bytes);
+      return bytes;
+    }
+    function imageKey(item) {
+      if (typeof item.aeskey === "string" && /^[a-f\d]{32}$/i.test(item.aeskey)) return Buffer.from(item.aeskey, "hex");
+      const encoded = item.media?.aes_key;
+      if (typeof encoded !== "string" || encoded.length > 64) throw error("INVALID_IMAGE", "\u5FAE\u4FE1\u56FE\u7247\u7F3A\u5C11\u89E3\u5BC6\u5BC6\u94A5\u3002");
+      const decoded = Buffer.from(encoded, "base64");
+      if (decoded.toString("base64") !== encoded) throw error("INVALID_IMAGE", "\u5FAE\u4FE1\u56FE\u7247\u5BC6\u94A5\u7F16\u7801\u65E0\u6548\u3002");
+      if (decoded.length === 16) return decoded;
+      if (decoded.length === 32 && /^[a-f\d]{32}$/i.test(decoded.toString("ascii"))) return Buffer.from(decoded.toString("ascii"), "hex");
+      throw error("INVALID_IMAGE", "\u5FAE\u4FE1\u56FE\u7247\u5BC6\u94A5\u7F16\u7801\u65E0\u6548\u3002");
+    }
+    async function readBounded(response, limit) {
+      if (Number(response.headers.get("content-length")) > limit) {
+        await response.body?.cancel();
+        throw error("IMAGE_TOO_LARGE", "\u5FAE\u4FE1\u56FE\u7247\u8D85\u8FC7 5 MiB\u3002");
+      }
+      if (!response.body) throw error("INVALID_IMAGE", "\u5FAE\u4FE1\u56FE\u7247\u5185\u5BB9\u4E3A\u7A7A\u3002");
+      const reader = response.body.getReader(), chunks = [];
+      let size = 0;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          size += value.byteLength;
+          if (size > limit) {
+            await reader.cancel();
+            throw error("IMAGE_TOO_LARGE", "\u5FAE\u4FE1\u56FE\u7247\u8D85\u8FC7 5 MiB\u3002");
+          }
+          chunks.push(Buffer.from(value));
+        }
+      } finally {
+        reader.releaseLock();
+      }
+      return Buffer.concat(chunks);
+    }
+    function prepareImage(bytes) {
+      const key = randomBytes(16), cipher = createCipheriv("aes-128-ecb", key, null);
+      return {
+        keyHex: key.toString("hex"),
+        fileKey: randomBytes(16).toString("hex"),
+        md5: createHash("md5").update(bytes).digest("hex"),
+        ciphertext: Buffer.concat([cipher.update(bytes), cipher.final()])
+      };
+    }
+    function decryptImage(bytes, item) {
+      try {
+        const decipher = createDecipheriv("aes-128-ecb", imageKey(item), null);
+        const plain = Buffer.concat([decipher.update(bytes), decipher.final()]);
+        if (!plain.length || plain.length > MAX_IMAGE_BYTES) throw error("INVALID_IMAGE", "\u5FAE\u4FE1\u56FE\u7247\u5927\u5C0F\u65E0\u6548\u3002");
+        imageExtension(plain);
+        return plain;
+      } catch (err) {
+        if (err.code === "INVALID_IMAGE") throw err;
+        throw error("INVALID_IMAGE", "\u5FAE\u4FE1\u56FE\u7247\u89E3\u5BC6\u5931\u8D25\uFF0C\u8BF7\u91CD\u65B0\u53D1\u9001\u3002");
+      }
+    }
+    module2.exports = { MAX_IMAGE_BYTES, CDN_ORIGIN, imageBytes, imageExtension, readBounded, prepareImage, decryptImage };
+  }
+});
+
 // src/ilink.cjs
 var require_ilink = __commonJS({
   "src/ilink.cjs"(exports2, module2) {
     var { randomBytes } = require("node:crypto");
-    var VERSION = "0.1.3";
+    var { MAX_IMAGE_BYTES, CDN_ORIGIN, imageExtension, readBounded, prepareImage, decryptImage } = require_media();
+    var VERSION = "0.2.0";
     var AUTH_ORIGIN = "https://ilinkai.weixin.qq.com";
     function error(code, message) {
       return Object.assign(new Error(message), { code });
@@ -4636,7 +4718,7 @@ var require_ilink = __commonJS({
         }
       }
       baseInfo() {
-        return { channel_version: VERSION, bot_agent: "CindyWechatCompanion/0.1.3" };
+        return { channel_version: VERSION, bot_agent: `CindyWechatCompanion/${VERSION}` };
       }
       lifecycle(action, signal) {
         return this.request(`ilink/bot/msg/notify${action}`, { body: { base_info: this.baseInfo() }, signal, timeout: 5e3 });
@@ -4655,6 +4737,70 @@ var require_ilink = __commonJS({
           context_token: contextToken
         } } });
       }
+      async cdn(url, init, signal) {
+        const deadline = AbortSignal.timeout(2e4);
+        try {
+          const response = await this.fetch(tencentUrl(url), { ...init, redirect: "manual", signal: signal ? AbortSignal.any([signal, deadline]) : deadline });
+          if (!response.ok) throw error("MEDIA_HTTP_ERROR", `\u5FAE\u4FE1\u56FE\u7247\u63A5\u53E3\u8FD4\u56DE HTTP ${response.status}\u3002`);
+          return response;
+        } catch (err) {
+          if (err.code) throw err;
+          throw error(signal?.aborted ? "CANCELLED" : "MEDIA_NETWORK_ERROR", "\u5FAE\u4FE1\u56FE\u7247\u4F20\u8F93\u4E2D\u65AD\uFF0C\u8BF7\u68C0\u67E5\u8FDE\u63A5\u3002");
+        }
+      }
+      async downloadImage(item, signal) {
+        const media = item.media;
+        let url;
+        if (typeof media?.full_url === "string" && media.full_url) url = tencentUrl(media.full_url);
+        else {
+          if (typeof media?.encrypt_query_param !== "string" || !media.encrypt_query_param || media.encrypt_query_param.length > 8192)
+            throw error("INVALID_IMAGE", "\u5FAE\u4FE1\u56FE\u7247\u7F3A\u5C11\u4E0B\u8F7D\u4FE1\u606F\u3002");
+          url = new URL("/c2c/download", CDN_ORIGIN);
+          url.searchParams.set("encrypted_query_param", media.encrypt_query_param);
+        }
+        const response = await this.cdn(url, { method: "GET" }, signal);
+        const bytes = decryptImage(await readBounded(response, MAX_IMAGE_BYTES + 16), item);
+        return { base64: bytes.toString("base64"), name: `wechat-image.${imageExtension(bytes)}` };
+      }
+      async uploadImage(peerId, bytes, signal) {
+        const prepared = prepareImage(bytes);
+        const result = await this.request("ilink/bot/getuploadurl", { signal, timeout: 15e3, body: {
+          filekey: prepared.fileKey,
+          media_type: 1,
+          to_user_id: peerId,
+          rawsize: bytes.length,
+          rawfilemd5: prepared.md5,
+          filesize: prepared.ciphertext.length,
+          no_need_thumb: true,
+          aeskey: prepared.keyHex,
+          base_info: this.baseInfo()
+        } });
+        let url;
+        if (typeof result.upload_full_url === "string" && result.upload_full_url.trim()) url = tencentUrl(result.upload_full_url);
+        else {
+          if (typeof result.upload_param !== "string" || !result.upload_param || result.upload_param.length > 8192)
+            throw error("INVALID_IMAGE", "\u5FAE\u4FE1\u672A\u8FD4\u56DE\u56FE\u7247\u4E0A\u4F20\u5730\u5740\u3002");
+          url = new URL("/c2c/upload", CDN_ORIGIN);
+          url.searchParams.set("encrypted_query_param", result.upload_param);
+          url.searchParams.set("filekey", prepared.fileKey);
+        }
+        const response = await this.cdn(url, { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: prepared.ciphertext }, signal);
+        const query = response.headers.get("x-encrypted-param");
+        await response.body?.cancel();
+        if (response.status !== 200 || !query || query.length > 8192) throw error("INVALID_IMAGE", "\u5FAE\u4FE1\u56FE\u7247\u4E0A\u4F20\u56DE\u6267\u4E0D\u5B8C\u6574\u3002");
+        return { media: { encrypt_query_param: query, aes_key: Buffer.from(prepared.keyHex).toString("base64"), encrypt_type: 1 }, mid_size: prepared.ciphertext.length };
+      }
+      sendImage({ peerId, contextToken, clientId, image }, signal) {
+        return this.request("ilink/bot/sendmessage", { signal, body: { base_info: this.baseInfo(), msg: {
+          from_user_id: "",
+          to_user_id: peerId,
+          client_id: clientId,
+          message_type: 2,
+          message_state: 2,
+          item_list: [{ type: 2, image_item: image }],
+          context_token: contextToken
+        } } });
+      }
     };
     function decodeMessage(message) {
       if (!message || typeof message !== "object" || message.message_type != null && message.message_type !== 1) return null;
@@ -4662,9 +4808,26 @@ var require_ilink = __commonJS({
       if (!id || typeof message.from_user_id !== "string" || !message.from_user_id || typeof message.context_token !== "string" || !message.context_token) return null;
       const items = Array.isArray(message.item_list) ? message.item_list : [];
       if (items.length > 20) throw error("BAD_RESPONSE", "\u5355\u6761\u5FAE\u4FE1\u6D88\u606F\u5305\u542B\u8FC7\u591A\u5185\u5BB9\u3002");
-      const unsupported = items.some((item) => item?.type !== 1);
-      const text = items.filter((item) => item?.type === 1 && typeof item.text_item?.text === "string").map((item) => item.text_item.text).join("\n");
-      return { id, text, unsupported, peerId: message.from_user_id, contextToken: message.context_token };
+      let unsupported = false, errorCode;
+      const parts = [], images = [];
+      for (const item of items) {
+        if (item?.type === 1 && typeof item.text_item?.text === "string") parts.push(item.text_item.text);
+        else if (item?.type === 2 && item.image_item?.media && (item.image_item.media.full_url || item.image_item.media.encrypt_query_param)) images.push(item.image_item);
+        else if (item?.type === 3) {
+          if (typeof item.voice_item?.text === "string" && item.voice_item.text.trim()) parts.push(`[\u5FAE\u4FE1\u8BED\u97F3\u8F6C\u6587\u5B57]
+${item.voice_item.text}`);
+          else {
+            unsupported = true;
+            errorCode = "VOICE_TRANSCRIPT_MISSING";
+          }
+        } else unsupported = true;
+      }
+      if (images.length > 4) {
+        unsupported = true;
+        errorCode = "TOO_MANY_IMAGES";
+      }
+      const text = parts.join("\n");
+      return { id, text, images, unsupported, errorCode, peerId: message.from_user_id, contextToken: message.context_token };
     }
     module2.exports = { IlinkClient, decodeMessage, tencentUrl, error, AUTH_ORIGIN };
   }
@@ -4747,10 +4910,13 @@ var require_state = __commonJS({
 var require_worker = __commonJS({
   "src/worker.cjs"(exports2, module2) {
     var readline = require("node:readline");
-    var { randomUUID } = require("node:crypto");
+    var { randomUUID, createHash } = require("node:crypto");
     var QRCode = require_lib();
     var { IlinkClient, decodeMessage, tencentUrl, error } = require_ilink();
     var { sealState, openState } = require_state();
+    var { imageBytes, MAX_IMAGE_BYTES } = require_media();
+    var MAX_PENDING_IMAGE_BYTES = 40 * 1024 * 1024;
+    var IMAGE_CHUNK_CHARS = 192 * 1024;
     var pause = (ms, signal) => new Promise((resolve) => {
       if (signal?.aborted) return resolve();
       const done = () => {
@@ -4768,6 +4934,7 @@ var require_worker = __commonJS({
         this.bots = /* @__PURE__ */ new Map();
         this.requests = /* @__PURE__ */ new Map();
         this.notify = notify;
+        this.pendingImageBytes = 0;
         this.clientFactory = clientFactory;
         this.encodeQr = encodeQr;
         this.checkpoint = checkpoint;
@@ -4817,7 +4984,11 @@ var require_worker = __commonJS({
         state.auth = void 0;
         state.authPoll = void 0;
         state.status = state.client ? "paused" : "disconnected";
-        for (const [id, entry] of this.requests) if (entry.botConfigId === state.config.id) this.requests.delete(id);
+        for (const [id, entry] of this.requests) if (entry.botConfigId === state.config.id) {
+          this.releaseImages(entry);
+          this.clearStaged(entry);
+          this.requests.delete(id);
+        }
       }
       disconnect(id) {
         const state = this.bot(id);
@@ -5012,6 +5183,7 @@ var require_worker = __commonJS({
             const result = await state.client.updates(state.cursor, signal);
             if (signal.aborted || state.generation !== generation) return;
             if (result.msgs !== void 0 && (!Array.isArray(result.msgs) || result.msgs.length > 100)) throw error("BAD_RESPONSE", "\u5FAE\u4FE1\u6D88\u606F\u5217\u8868\u65E0\u6548\u6216\u8FC7\u5927\u3002");
+            if (result.msgs?.length || failures) state.lastErrorCode = null;
             const previousCursor = state.cursor, batch = [];
             for (const raw of result.msgs ?? []) {
               const event = this.ingest(state, generation, raw, false);
@@ -5028,10 +5200,18 @@ var require_worker = __commonJS({
               }
             }
             if (signal.aborted || state.generation !== generation) return;
-            for (const event of batch) this.notify("wechat/inbound", event);
+            for (const event of batch) {
+              try {
+                const prepared = await this.prepareInbound(event, signal);
+                if (signal.aborted || state.generation !== generation) return;
+                this.notifyInbound(prepared);
+              } catch (err) {
+                if (signal.aborted || state.generation !== generation) return;
+                this.reject(event.requestId, err.code ?? "IMAGE_DOWNLOAD_FAILED");
+              }
+            }
             failures = 0;
             state.status = "connected";
-            state.lastErrorCode = null;
             await pause(200, signal);
           } catch (err) {
             if (signal.aborted) return;
@@ -5060,7 +5240,11 @@ var require_worker = __commonJS({
       ingest(state, generation, raw, emit = true) {
         const message = decodeMessage(raw);
         if (!message || state.seen.has(message.id)) return;
-        for (const [id, entry2] of this.requests) if (Date.now() - entry2.createdAt > 30 * 6e4) this.requests.delete(id);
+        for (const [id, entry2] of this.requests) if (Date.now() - entry2.createdAt > 30 * 6e4) {
+          this.releaseImages(entry2);
+          this.clearStaged(entry2);
+          this.requests.delete(id);
+        }
         const requestId = randomUUID();
         const entry = { ...message, requestId, botConfigId: state.config.id, generation, state: "pending", createdAt: Date.now() };
         const count = [...this.requests.values()].filter((item) => item.botConfigId === state.config.id && item.state === "pending").length;
@@ -5072,19 +5256,93 @@ var require_worker = __commonJS({
         if (state.seen.size > 512) state.seen.delete(state.seen.values().next().value);
         this.requests.set(requestId, entry);
         state.stats.received++;
-        if (message.unsupported || !message.text.trim() || message.text.length > 16e3) {
+        if (message.unsupported || !message.text.trim() && !message.images.length || message.text.length > 16e3) {
           state.stats.rejected++;
           entry.state = "rejected";
-          state.lastErrorCode = "UNSUPPORTED_MESSAGE";
+          state.lastErrorCode = message.errorCode ?? "UNSUPPORTED_MESSAGE";
           return;
         }
-        const event = { requestId, botConfigId: state.config.id, generation, instanceId: this.instanceId, text: message.text };
-        if (emit) this.notify("wechat/inbound", event);
+        const event = { requestId, botConfigId: state.config.id, generation, instanceId: this.instanceId, text: message.text.trim() ? message.text : "\u8BF7\u67E5\u770B\u5FAE\u4FE1\u7528\u6237\u53D1\u9001\u7684\u56FE\u7247\u3002" };
+        if (emit && !message.images.length) this.notify("wechat/inbound", event);
+        else if (emit) void this.prepareInbound(event, state.abort?.signal).then((prepared) => this.notifyInbound(prepared), (err) => this.reject(requestId, err.code ?? "IMAGE_DOWNLOAD_FAILED"));
         return event;
+      }
+      releaseImages(entry) {
+        this.pendingImageBytes -= entry.mediaBytes ?? 0;
+        entry.mediaBytes = 0;
+        entry.images = [];
+      }
+      notifyInbound(event) {
+        const { attachments, ...metadata } = event;
+        for (let index = 0; index < (attachments?.length ?? 0); index++) {
+          const data = attachments[index].base64;
+          for (let offset = 0, seq = 0; offset < data.length; offset += IMAGE_CHUNK_CHARS, seq++)
+            this.notify("wechat/image-chunk", {
+              requestId: event.requestId,
+              botConfigId: event.botConfigId,
+              generation: event.generation,
+              instanceId: this.instanceId,
+              index,
+              seq,
+              base64: data.slice(offset, offset + IMAGE_CHUNK_CHARS)
+            });
+        }
+        this.notify("wechat/inbound", { ...metadata, ...attachments?.length ? { imageParts: attachments.map((item) => ({ name: item.name, chars: item.base64.length, chunks: Math.ceil(item.base64.length / IMAGE_CHUNK_CHARS) })) } : {} });
+      }
+      stagedEntry({ requestId, generation }) {
+        const entry = this.requests.get(requestId), state = entry && this.bots.get(entry.botConfigId);
+        if (!entry || Date.now() - entry.createdAt > 30 * 6e4) throw error("REQUEST_EXPIRED", "\u56FE\u7247\u56DE\u4F20\u8BF7\u6C42\u5DF2\u8FC7\u671F\u3002");
+        if (!state?.client || !state.config.enabled || state.generation !== generation || entry.generation !== generation) throw error("BINDING_CHANGED", "\u56FE\u7247\u56DE\u4F20\u7ED1\u5B9A\u5DF2\u6539\u53D8\u3002");
+        if (entry.state !== "pending") throw error("REQUEST_REJECTED", "\u56FE\u7247\u56DE\u4F20\u8BF7\u6C42\u5DF2\u7ED3\u675F\u3002");
+        return entry;
+      }
+      clearStaged(entry) {
+        this.pendingImageBytes -= entry.stagedBytes ?? 0;
+        entry.stagedBytes = 0;
+        entry.stagedImages = void 0;
+        entry.stagedLengths = void 0;
+      }
+      stageBegin(args) {
+        const entry = this.stagedEntry(args), lengths = args.lengths;
+        if (!Array.isArray(lengths) || !lengths.length || lengths.length > 4 || lengths.some((length) => !Number.isInteger(length) || length < 4 || length % 4 || length > Math.ceil(MAX_IMAGE_BYTES / 3) * 4))
+          throw error("INVALID_IMAGE", "\u56FE\u7247\u5206\u5757\u957F\u5EA6\u65E0\u6548\u3002");
+        this.clearStaged(entry);
+        this.releaseImages(entry);
+        if (this.pendingImageBytes + lengths.length * MAX_IMAGE_BYTES > MAX_PENDING_IMAGE_BYTES) throw error("MEDIA_INBOX_FULL", "\u7B49\u5F85\u4F20\u8F93\u7684\u56FE\u7247\u8FC7\u591A\uFF0C\u8BF7\u7A0D\u540E\u91CD\u65B0\u53D1\u9001\u8BF7\u6C42\u3002");
+        entry.stagedBytes = lengths.length * MAX_IMAGE_BYTES;
+        this.pendingImageBytes += entry.stagedBytes;
+        entry.stagedLengths = lengths;
+        entry.stagedImages = lengths.map(() => []);
+        return { ready: true };
+      }
+      stageChunk(args) {
+        const entry = this.stagedEntry(args), chunks = entry.stagedImages?.[args.index];
+        if (!Number.isInteger(args.index) || !chunks || !Number.isInteger(args.seq) || args.seq !== chunks.length || typeof args.base64 !== "string" || !args.base64 || args.base64.length > IMAGE_CHUNK_CHARS || args.base64.length % 4 || !/^[A-Za-z0-9+/]+={0,2}$/.test(args.base64) || chunks.length && chunks.at(-1).includes("=") || chunks.length * IMAGE_CHUNK_CHARS + args.base64.length > entry.stagedLengths[args.index])
+          throw error("INVALID_IMAGE", "\u56FE\u7247\u5206\u5757\u987A\u5E8F\u6216\u5185\u5BB9\u65E0\u6548\u3002");
+        chunks.push(args.base64);
+        return { accepted: true };
+      }
+      async prepareInbound(event, signal) {
+        const entry = this.requests.get(event.requestId), state = this.bots.get(event.botConfigId);
+        const current = () => entry && entry.state === "pending" && this.requests.get(event.requestId) === entry && state?.config.enabled && state.generation === event.generation && !signal?.aborted;
+        if (!current()) throw error("BINDING_CHANGED", "\u7ED1\u5B9A\u5DF2\u6539\u53D8\uFF0C\u4E0D\u80FD\u8F6C\u4EA4\u65E7\u56FE\u7247\u3002");
+        const attachments = [];
+        for (const item of entry.images) {
+          if (this.pendingImageBytes + MAX_IMAGE_BYTES > MAX_PENDING_IMAGE_BYTES) throw error("MEDIA_INBOX_FULL", "\u7B49\u5F85\u5904\u7406\u7684\u5FAE\u4FE1\u56FE\u7247\u8FC7\u591A\uFF0C\u8BF7\u7A0D\u540E\u91CD\u65B0\u53D1\u9001\u3002");
+          this.pendingImageBytes += MAX_IMAGE_BYTES;
+          entry.mediaBytes = (entry.mediaBytes ?? 0) + MAX_IMAGE_BYTES;
+          const attachment = await state.client.downloadImage(item, signal);
+          if (!current()) throw error("BINDING_CHANGED", "\u7ED1\u5B9A\u5DF2\u6539\u53D8\uFF0C\u4E0D\u80FD\u8F6C\u4EA4\u65E7\u56FE\u7247\u3002");
+          attachments.push(attachment);
+        }
+        return { ...event, ...attachments.length ? { attachments } : {} };
       }
       reject(requestId, code) {
         const entry = this.requests.get(requestId);
         if (!entry) return { rejected: false };
+        if (entry.state === "rejected") return { rejected: false };
+        this.releaseImages(entry);
+        this.clearStaged(entry);
         entry.state = "rejected";
         const state = this.bots.get(entry.botConfigId);
         if (state) {
@@ -5093,19 +5351,34 @@ var require_worker = __commonJS({
         }
         return { rejected: true };
       }
-      async reply({ requestId, generation, text }) {
+      async reply({ requestId, generation, text = "", images = [], useStagedImages = false }) {
         const entry = this.requests.get(requestId);
         if (!entry || Date.now() - entry.createdAt > 30 * 6e4) throw error("REQUEST_EXPIRED", "\u56DE\u4F20\u8BF7\u6C42\u4E0D\u5B58\u5728\u6216\u8FC7\u671F\u3002");
         const state = this.bot(entry.botConfigId);
         if (!state.config.enabled || !state.client || state.generation !== entry.generation || generation !== entry.generation)
           throw error("BINDING_CHANGED", "Bot \u5DF2\u505C\u7528\u3001\u91CD\u8FDE\u6216\u66F4\u6362\u7ED1\u5B9A\u3002");
-        if (typeof text !== "string" || !text.trim() || text.length > 8e3) throw error("INVALID_REPLY", "\u56DE\u590D\u5FC5\u987B\u662F 1\u20138000 \u5B57\u7B26\u3002");
-        if (entry.replyText !== void 0) {
-          if (entry.replyText !== text) throw error("REPLY_CONFLICT", "\u4E0D\u80FD\u4E3A\u540C\u4E00\u6D88\u606F\u53D1\u9001\u4E0D\u540C\u56DE\u590D\u3002");
+        if (useStagedImages) {
+          if (entry.replyKey !== void 0 && entry.replyHadStaged) {
+            if (entry.replyText !== text) throw error("REPLY_CONFLICT", "\u4E0D\u80FD\u4E3A\u540C\u4E00\u6D88\u606F\u53D1\u9001\u4E0D\u540C\u56DE\u590D\u3002");
+            this.clearStaged(entry);
+            return entry.replyPromise;
+          }
+          if (!entry.stagedImages || entry.stagedImages.some((chunks2, index) => chunks2.join("").length !== entry.stagedLengths[index]))
+            throw error("INVALID_IMAGE", "\u56FE\u7247\u5206\u5757\u5C1A\u672A\u5B8C\u6574\u4EA4\u63A5\u3002");
+          images = entry.stagedImages.map((chunks2) => chunks2.join(""));
+        }
+        if (typeof text !== "string" || text.length > 8e3 || !Array.isArray(images) || images.length > 4 || !text.trim() && !images.length)
+          throw error("INVALID_REPLY", "\u56DE\u590D\u987B\u5305\u542B\u6587\u5B57\u6216 1\u20134 \u5F20\u56FE\u7247\uFF0C\u6587\u5B57\u6700\u591A 8000 \u5B57\u7B26\u3002");
+        const buffers = images.map(imageBytes);
+        const replyKey = JSON.stringify([text, buffers.map((bytes) => createHash("sha256").update(bytes).digest("hex"))]);
+        if (entry.replyKey !== void 0) {
+          if (entry.replyKey !== replyKey) throw error("REPLY_CONFLICT", "\u4E0D\u80FD\u4E3A\u540C\u4E00\u6D88\u606F\u53D1\u9001\u4E0D\u540C\u56DE\u590D\u3002");
           return entry.replyPromise;
         }
         if (entry.state !== "pending") throw error("REQUEST_REJECTED", "\u8FD9\u6761\u5FAE\u4FE1\u6D88\u606F\u672A\u88AB\u53D7\u7406\u3002");
+        entry.replyKey = replyKey;
         entry.replyText = text;
+        entry.replyHadStaged = useStagedImages;
         entry.state = "sending";
         const chunks = [];
         let chunk = "";
@@ -5118,18 +5391,45 @@ var require_worker = __commonJS({
         }
         if (chunk) chunks.push(chunk);
         entry.replyPromise = (async () => {
+          let sendAttempted = false;
+          const signal = state.abort?.signal ? AbortSignal.any([state.abort.signal, AbortSignal.timeout(21e4)]) : AbortSignal.timeout(21e4);
+          const assertCurrent = () => {
+            if (state.generation !== generation || !state.config.enabled || signal.aborted) throw error("BINDING_CHANGED", "\u53D1\u9001\u671F\u95F4\u7ED1\u5B9A\u6539\u53D8\u6216\u8BF7\u6C42\u53D6\u6D88\u3002");
+          };
           try {
+            const uploaded = [];
+            for (const bytes of buffers) {
+              assertCurrent();
+              this.notify("wechat/reply-progress", { requestId, instanceId: this.instanceId });
+              uploaded.push(await state.client.uploadImage(entry.peerId, bytes, signal));
+            }
             for (const chunk2 of chunks) {
-              if (state.generation !== generation || !state.config.enabled) throw error("BINDING_CHANGED", "\u53D1\u9001\u671F\u95F4\u7ED1\u5B9A\u6539\u53D8\u3002");
-              await state.client.send({ peerId: entry.peerId, contextToken: entry.contextToken, clientId: randomUUID(), text: chunk2 }, state.abort?.signal);
+              assertCurrent();
+              sendAttempted = true;
+              if (buffers.length) this.notify("wechat/reply-progress", { requestId, instanceId: this.instanceId });
+              await state.client.send({ peerId: entry.peerId, contextToken: entry.contextToken, clientId: randomUUID(), text: chunk2 }, signal);
+            }
+            for (const image of uploaded) {
+              assertCurrent();
+              sendAttempted = true;
+              this.notify("wechat/reply-progress", { requestId, instanceId: this.instanceId });
+              await state.client.sendImage({ peerId: entry.peerId, contextToken: entry.contextToken, clientId: randomUUID(), image }, signal);
             }
             entry.state = "sent";
             state.stats.delivered++;
-            return { delivered: true, requestId, chunks: chunks.length };
-          } catch {
+            return { delivered: true, requestId, chunks: chunks.length, images: uploaded.length };
+          } catch (err) {
+            if (!sendAttempted) {
+              entry.state = "rejected";
+              state.lastErrorCode = err.code ?? "IMAGE_UPLOAD_FAILED";
+              throw error("IMAGE_UPLOAD_FAILED", "\u56FE\u7247\u51C6\u5907\u6216\u4E0A\u4F20\u5931\u8D25\uFF0C\u5C1A\u672A\u53D1\u9001\u56DE\u590D\uFF0C\u8BF7\u8BA9\u5FAE\u4FE1\u7528\u6237\u91CD\u65B0\u53D1\u9001\u8BF7\u6C42\u3002");
+            }
             entry.state = "uncertain";
             state.lastErrorCode = "DELIVERY_UNCERTAIN";
             throw error("DELIVERY_UNCERTAIN", "\u5FAE\u4FE1\u53D1\u9001\u7ED3\u679C\u4E0D\u786E\u5B9A\uFF1B\u8BF7\u5728\u5FAE\u4FE1\u68C0\u67E5\uFF0C\u4E0D\u80FD\u81EA\u52A8\u91CD\u53D1\u3002");
+          } finally {
+            this.releaseImages(entry);
+            this.clearStaged(entry);
           }
         })();
         return entry.replyPromise;
@@ -5216,6 +5516,17 @@ var require_worker = __commonJS({
             case "reply":
               result = await manager.reply(args);
               break;
+            case "reply/images/begin":
+              result = manager.stageBegin(args);
+              break;
+            case "reply/images/chunk":
+              result = manager.stageChunk(args);
+              break;
+            case "reply/images/clear": {
+              manager.clearStaged(manager.stagedEntry(args));
+              result = { cleared: true };
+              break;
+            }
             case "reject":
               result = manager.reject(args.requestId, args.code);
               break;

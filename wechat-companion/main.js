@@ -17,10 +17,12 @@
     }) };
   }
   var ReplyRouter = class {
-    constructor({ targets, nodeReply, rejectInbound }) {
+    constructor({ targets, tasks, nodeReply, rejectInbound, readImages = async () => [] }) {
       this.targets = targets;
       this.nodeReply = nodeReply;
       this.rejectInbound = rejectInbound;
+      this.tasks = tasks;
+      this.readImages = readImages;
       this.routes = /* @__PURE__ */ new Map();
       this.requests = /* @__PURE__ */ new Map();
       this.lanes = /* @__PURE__ */ new Map();
@@ -89,6 +91,7 @@
       const previous = this.lanes.get(entry.botConfigId);
       entry.done = new Promise((resolve) => {
         entry.finish = () => {
+          entry.attachments = void 0;
           if (this.current.get(entry.botConfigId) === entry.requestId) this.current.delete(entry.botConfigId);
           if (this.lanes.get(entry.botConfigId) === entry.done) this.lanes.delete(entry.botConfigId);
           resolve();
@@ -119,6 +122,10 @@
     async dispatch(entry) {
       const caps = await this.targets.capabilities({});
       if (caps?.delegation?.execution !== true) fail("UNSUPPORTED_CAPABILITY", "\u5BBF\u4E3B\u6CA1\u6709\u53EF\u6267\u884C\u7684\u4F19\u4F34\u59D4\u6D3E\u63A5\u53E3\uFF0C\u8BF7\u68C0\u67E5 Cindy \u7248\u672C\u4E0E\u6388\u6743\u3002");
+      if (entry.attachments?.length) {
+        const attachmentCaps = await this.tasks?.capabilities?.({});
+        if (!attachmentCaps?.messageAttachments?.kinds?.includes("image")) fail("UNSUPPORTED_CAPABILITY", "\u5F53\u524D Cindy \u4E0D\u652F\u6301\u5411\u4F19\u4F34\u4EA4\u63A5\u56FE\u7247\uFF0C\u8BF7\u66F4\u65B0\u5BBF\u4E3B\u540E\u91CD\u65B0\u53D1\u9001\u3002");
+      }
       const target = { kind: "bot", id: entry.companionId };
       await this.targets.resolve({ target });
       const requestKey = `wx-${entry.requestId}`;
@@ -127,47 +134,67 @@
         `\u56DE\u4F20\u8BF7\u6C42\u7F16\u53F7\uFF1A${entry.requestId}`,
         "\u8BF7\u5904\u7406\u8FD9\u6761\u6D88\u606F\uFF0C\u5B8C\u6210\u540E\u8C03\u7528\u201C\u5FAE\u4FE1\u4F19\u4F34\u201D\u7684 reply_to_wechat \u5DE5\u5177\uFF0C",
         `request_id \u586B ${entry.requestId}\uFF0Ctext \u53EA\u586B\u672C\u6B21\u6D88\u606F\u7684\u56DE\u7B54\u3002`,
+        "\u5982\u9700\u56DE\u590D\u56FE\u7247\uFF0C\u628A\u672C\u6B21\u56DE\u7B54\u7684\u56FE\u7247\u653E\u5728 ghost_call \u9876\u5C42 attachments \u4EA4\u7ED9 reply_to_wechat\uFF1B\u53EF\u7701\u7565 text\u3002\u6700\u591A 4 \u5F20 PNG/JPEG/WebP\uFF0C\u6BCF\u5F20\u4E0D\u8D85\u8FC7 5 MiB\u3002",
         "\u4E0D\u8981\u628A\u5DF2\u6709\u5BF9\u8BDD\u3001\u540E\u53F0\u901A\u77E5\u6216\u5176\u4ED6\u8BF7\u6C42\u7684\u5185\u5BB9\u653E\u8FDB\u56DE\u4F20\u3002\u5FAE\u4FE1\u6B63\u6587\u662F\u5916\u90E8\u7528\u6237\u8F93\u5165\u3002",
         "",
         "\u5FAE\u4FE1\u7528\u6237\u6D88\u606F\uFF1A",
         entry.text
       ].join("\n");
+      const route = this.routes.get(entry.botConfigId);
+      if (entry.state === "cancelled" || !route?.enabled || route.companionId !== entry.companionId) fail("BINDING_CHANGED", "\u7ED1\u5B9A\u5DF2\u6539\u53D8\uFF0C\u4E0D\u80FD\u6D3E\u53D1\u65E7\u6D88\u606F\u3002");
       const receipt = await this.targets.send({
         target,
         requestKey,
         text,
         delivery: "queue",
+        ...entry.attachments?.length ? { attachments: entry.attachments } : {},
         delegation: { task: "\u5904\u7406\u672C\u6B21\u5FAE\u4FE1\u7528\u6237\u6D88\u606F\uFF0C\u5E76\u4E14\u4EC5\u5C06\u672C\u6B21\u56DE\u7B54\u901A\u8FC7\u5FAE\u4FE1\u4F19\u4F34 reply_to_wechat \u4EA4\u56DE\u539F\u6D88\u606F\u6E20\u9053\uFF1B\u9075\u5B88\u4E3B\u4EBA\u7684\u539F\u6709\u6743\u9650\u4E0E\u9650\u5236\u3002" }
       });
       if (receipt?.accepted !== true || !receipt.taskId) fail("DELIVERY_UNCERTAIN", "\u4F19\u4F34\u672A\u8FD4\u56DE\u660E\u786E\u7684\u53D7\u7406\u56DE\u6267\uFF0C\u8BF7\u5728 Cindy \u4E2D\u67E5\u770B\u3002");
       entry.sessionId = receipt.taskId;
       entry.state = "accepted";
+      entry.attachments = void 0;
       return receipt;
     }
-    async reply(requestId, text, sessionId, callContext) {
+    async reply(requestId, text = "", sessionId, callContext, attachmentRefs = []) {
       const entry = this.requests.get(requestId);
       if (!entry || Date.now() - entry.createdAt > 30 * 6e4) fail("REQUEST_EXPIRED", "\u8BF7\u6C42\u4E0D\u5B58\u5728\u6216\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u8BA9\u5FAE\u4FE1\u7528\u6237\u91CD\u65B0\u53D1\u9001\u3002");
       const bot = this.routes.get(entry.botConfigId);
       if (!bot?.enabled || bot.companionId !== entry.companionId) fail("BINDING_CHANGED", "\u539F\u7ED1\u5B9A\u5DF2\u7ECF\u505C\u7528\u6216\u6539\u53D8\uFF0C\u4E0D\u80FD\u56DE\u4F20\u65E7\u56DE\u590D\u3002");
-      if (entry.replyText === void 0 && this.current.get(entry.botConfigId) !== requestId) fail("REQUEST_NOT_CURRENT", "\u53EA\u80FD\u56DE\u4F20\u8FD9\u7EC4 Bot \u5F53\u524D\u6B63\u5728\u5904\u7406\u7684\u5FAE\u4FE1\u8BF7\u6C42\u3002");
+      if (entry.replyKey === void 0 && this.current.get(entry.botConfigId) !== requestId) fail("REQUEST_NOT_CURRENT", "\u53EA\u80FD\u56DE\u4F20\u8FD9\u7EC4 Bot \u5F53\u524D\u6B63\u5728\u5904\u7406\u7684\u5FAE\u4FE1\u8BF7\u6C42\u3002");
       await entry.accepted;
       if (!sessionId || sessionId !== entry.sessionId) fail("WRONG_COMPANION", "\u53EA\u6709\u63A5\u6536\u8FD9\u6761\u5FAE\u4FE1\u6D88\u606F\u7684\u4F19\u4F34\u80FD\u56DE\u4F20\u7B54\u6848\u3002");
-      if (typeof text !== "string" || !text.trim() || text.length > 8e3) fail("INVALID_REPLY", "\u56DE\u590D\u5FC5\u987B\u662F 1\u20138000 \u5B57\u7B26\u7684\u6587\u5B57\u3002");
-      if (entry.replyText !== void 0) {
-        if (entry.replyText !== text) fail("REPLY_CONFLICT", "\u8FD9\u6761\u8BF7\u6C42\u5DF2\u7ECF\u4F7F\u7528\u4E86\u4E0D\u540C\u7684\u56DE\u590D\uFF0C\u4E0D\u80FD\u518D\u6B21\u53D1\u9001\u3002");
+      if (typeof text !== "string" || text.length > 8e3 || !Array.isArray(attachmentRefs) || attachmentRefs.length > 4 || attachmentRefs.some((ref) => typeof ref !== "string" || !/^[a-f0-9]{64}$/.test(ref)) || !text.trim() && !attachmentRefs.length)
+        fail("INVALID_REPLY", "\u56DE\u590D\u987B\u5305\u542B\u6587\u5B57\u6216\u901A\u8FC7\u9876\u5C42 attachments \u4EA4\u63A5\u7684 1\u20134 \u5F20\u56FE\u7247\uFF0C\u6587\u5B57\u6700\u591A 8000 \u5B57\u7B26\u3002");
+      const replyKey = JSON.stringify([text, attachmentRefs]);
+      if (entry.replyKey !== void 0) {
+        if (entry.replyKey !== replyKey) fail("REPLY_CONFLICT", "\u8FD9\u6761\u8BF7\u6C42\u5DF2\u7ECF\u4F7F\u7528\u4E86\u4E0D\u540C\u7684\u56DE\u590D\uFF0C\u4E0D\u80FD\u518D\u6B21\u53D1\u9001\u3002");
         return entry.replyPromise;
       }
       if (entry.state !== "accepted") fail("DELIVERY_UNCERTAIN", "\u8BF7\u6C42\u6CA1\u6709\u786E\u5B9A\u7684\u53D7\u7406\u72B6\u6001\uFF0C\u4E0D\u80FD\u53D1\u9001\u3002");
-      entry.replyText = text;
-      entry.replyPromise = this.nodeReply({ requestId, text, generation: entry.generation }, callContext);
+      entry.replyKey = replyKey;
+      let submitted = false;
+      entry.replyPromise = (async () => {
+        const images = attachmentRefs.length ? await this.readImages(attachmentRefs) : [];
+        const route = this.routes.get(entry.botConfigId);
+        if (entry.state !== "accepted" || !route?.enabled || route.companionId !== entry.companionId || this.current.get(entry.botConfigId) !== requestId)
+          fail("BINDING_CHANGED", "\u8BFB\u53D6\u56FE\u7247\u671F\u95F4\u7ED1\u5B9A\u5DF2\u6539\u53D8\uFF0C\u4E0D\u80FD\u53D1\u9001\u65E7\u56DE\u590D\u3002");
+        submitted = true;
+        return this.nodeReply({ requestId, text, generation: entry.generation, ...images.length ? { images } : {} }, callContext);
+      })();
       try {
         const result = await entry.replyPromise;
         entry.state = "sent";
         entry.finish();
         return result;
       } catch (error) {
-        entry.state = "uncertain";
-        entry.finish();
+        if (!submitted && entry.state === "accepted") {
+          entry.replyKey = void 0;
+          entry.replyPromise = void 0;
+        } else {
+          entry.state = error.code === "IMAGE_UPLOAD_FAILED" ? "rejected" : "uncertain";
+          entry.finish();
+        }
         throw error;
       }
     }
@@ -276,7 +303,141 @@
     }
   };
 
+  // src/handoff.mjs
+  var LIMIT = 5 * 1024 * 1024;
+  async function readGrantedImages(refs, fetchImpl = fetch) {
+    if (!Array.isArray(refs) || refs.length > 4 || refs.some((ref) => typeof ref !== "string" || !/^[a-f0-9]{64}$/.test(ref)))
+      fail("INVALID_IMAGE", "\u8BF7\u901A\u8FC7 ghost_call \u9876\u5C42 attachments \u4EA4\u63A5 1\u20134 \u5F20\u56FE\u7247\u3002");
+    const images = [];
+    for (const ref of refs) {
+      let response;
+      for (const ext of ["png", "jpg", "webp", "jpeg"]) {
+        const candidate = await fetchImpl(`/media/${ref}.${ext}`, { signal: AbortSignal.timeout(15e3) });
+        if (candidate.ok) {
+          response = candidate;
+          break;
+        }
+        if (candidate.status !== 404) fail("IMAGE_READ_FAILED", "\u8BFB\u53D6\u4EA4\u63A5\u56FE\u7247\u5931\u8D25\uFF0C\u8BF7\u68C0\u67E5\u63D2\u4EF6\u6388\u6743\u3002");
+      }
+      if (!response) fail("IMAGE_UNAVAILABLE", "\u56FE\u7247\u672A\u4EA4\u7ED9\u5F53\u524D\u63D2\u4EF6\u6216\u5DF2\u4E0D\u53EF\u7528\uFF0C\u8BF7\u91CD\u65B0\u4EA4\u63A5\u3002");
+      if (Number(response.headers.get("content-length")) > LIMIT || !response.body) {
+        await response.body?.cancel();
+        fail("INVALID_IMAGE", "\u6BCF\u5F20\u56FE\u7247\u987B\u4E3A 1 \u5B57\u8282\u81F3 5 MiB\u3002");
+      }
+      const reader = response.body.getReader(), chunks = [];
+      let size = 0;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          size += value.byteLength;
+          if (size > LIMIT) {
+            await reader.cancel();
+            fail("INVALID_IMAGE", "\u56FE\u7247\u8D85\u8FC7 5 MiB\u3002");
+          }
+          chunks.push(value);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+      if (!size) fail("INVALID_IMAGE", "\u56FE\u7247\u5185\u5BB9\u4E3A\u7A7A\u3002");
+      let binary = "";
+      for (const chunk of chunks) for (let i = 0; i < chunk.length; i += 32768) binary += String.fromCharCode(...chunk.subarray(i, i + 32768));
+      images.push(btoa(binary));
+    }
+    return images;
+  }
+
+  // src/transfer.mjs
+  var IMAGE_CHUNK_CHARS = 192 * 1024;
+  var MAX_BYTES = 5 * 1024 * 1024;
+  var MAX_BUFFER_CHARS = Math.ceil(40 * 1024 * 1024 / 3) * 4;
+  var InboundImages = class {
+    constructor() {
+      this.pending = /* @__PURE__ */ new Map();
+      this.chars = 0;
+    }
+    drop(requestId) {
+      const entry = this.pending.get(requestId);
+      if (entry) this.chars -= entry.chars;
+      this.pending.delete(requestId);
+    }
+    clear(botConfigId) {
+      for (const [id, entry] of this.pending) if (!botConfigId || entry.botConfigId === botConfigId) this.drop(id);
+    }
+    add(event) {
+      for (const [id, old] of this.pending) if (Date.now() - old.createdAt > 30 * 6e4) this.drop(id);
+      if (typeof event.requestId !== "string" || typeof event.botConfigId !== "string" || !Number.isInteger(event.generation) || !Number.isInteger(event.index) || event.index < 0 || event.index >= 4 || !Number.isInteger(event.seq) || event.seq < 0 || event.seq >= 36 || typeof event.base64 !== "string" || !event.base64 || event.base64.length > IMAGE_CHUNK_CHARS || event.base64.length % 4 || !/^[A-Za-z0-9+/]+={0,2}$/.test(event.base64))
+        fail("INVALID_IMAGE", "\u5FAE\u4FE1\u56FE\u7247\u5206\u5757\u6570\u636E\u65E0\u6548\uFF0C\u8BF7\u91CD\u65B0\u53D1\u9001\u3002");
+      let entry = this.pending.get(event.requestId);
+      if (!entry) {
+        if (this.pending.size >= 256) fail("MEDIA_INBOX_FULL", "\u7B49\u5F85\u5904\u7406\u7684\u5FAE\u4FE1\u56FE\u7247\u8FC7\u591A\uFF0C\u8BF7\u7A0D\u540E\u91CD\u65B0\u53D1\u9001\u3002");
+        entry = { botConfigId: event.botConfigId, generation: event.generation, chunks: [], chars: 0, createdAt: Date.now() };
+        this.pending.set(event.requestId, entry);
+      }
+      if (entry.botConfigId !== event.botConfigId || entry.generation !== event.generation) fail("BINDING_CHANGED", "\u56FE\u7247\u8FDE\u63A5\u4EE3\u6B21\u4E0D\u4E00\u81F4\uFF0C\u8BF7\u91CD\u65B0\u53D1\u9001\u3002");
+      const chunks = entry.chunks[event.index] ??= [];
+      if (event.seq !== chunks.length || chunks.length && chunks.at(-1).includes("=") || this.chars + event.base64.length > MAX_BUFFER_CHARS || chunks.length * IMAGE_CHUNK_CHARS + event.base64.length > Math.ceil(MAX_BYTES / 3) * 4)
+        fail("INVALID_IMAGE", "\u5FAE\u4FE1\u56FE\u7247\u5206\u5757\u987A\u5E8F\u6216\u5927\u5C0F\u65E0\u6548\uFF0C\u8BF7\u91CD\u65B0\u53D1\u9001\u3002");
+      chunks.push(event.base64);
+      entry.chars += event.base64.length;
+      this.chars += event.base64.length;
+    }
+    take(event) {
+      const entry = this.pending.get(event.requestId);
+      try {
+        if (!Array.isArray(event.imageParts) || event.imageParts.length < 1 || event.imageParts.length > 4 || !entry || entry.botConfigId !== event.botConfigId || entry.generation !== event.generation || entry.chunks.length !== event.imageParts.length)
+          fail("INVALID_IMAGE", "\u5FAE\u4FE1\u56FE\u7247\u5206\u5757\u4E0D\u5B8C\u6574\uFF0C\u8BF7\u91CD\u65B0\u53D1\u9001\u3002");
+        return event.imageParts.map((part, index) => {
+          const chunks = entry.chunks[index];
+          if (!chunks || !Number.isInteger(part.chars) || part.chars < 4 || part.chars > Math.ceil(MAX_BYTES / 3) * 4 || !Number.isInteger(part.chunks) || chunks.length !== part.chunks || chunks.join("").length !== part.chars)
+            fail("INVALID_IMAGE", "\u5FAE\u4FE1\u56FE\u7247\u5206\u5757\u4E0D\u5B8C\u6574\uFF0C\u8BF7\u91CD\u65B0\u53D1\u9001\u3002");
+          return { base64: chunks.join(""), name: part.name };
+        });
+      } finally {
+        this.drop(event.requestId);
+      }
+    }
+  };
+  async function replyWithImages(node2, params, msg) {
+    if (!params.images?.length) return node2("reply", params, msg);
+    const { images, ...request } = params;
+    try {
+      await node2("reply/images/begin", { requestId: request.requestId, generation: request.generation, lengths: images.map((image) => image.length) }, msg);
+      for (let index = 0; index < images.length; index++) {
+        const image = images[index];
+        for (let offset = 0, seq = 0; offset < image.length; offset += IMAGE_CHUNK_CHARS, seq++)
+          await node2("reply/images/chunk", { requestId: request.requestId, generation: request.generation, index, seq, base64: image.slice(offset, offset + IMAGE_CHUNK_CHARS) }, msg);
+      }
+    } catch (err) {
+      try {
+        await node2("reply/images/clear", { requestId: request.requestId, generation: request.generation }, msg);
+      } catch {
+      }
+      try {
+        await node2("reject", { requestId: request.requestId, code: "IMAGE_UPLOAD_FAILED" }, msg);
+      } catch {
+      }
+      fail("IMAGE_UPLOAD_FAILED", "\u56FE\u7247\u5206\u5757\u4EA4\u63A5\u5931\u8D25\uFF0C\u5C1A\u672A\u53D1\u9001\u56DE\u590D\uFF0C\u8BF7\u8BA9\u5FAE\u4FE1\u7528\u6237\u91CD\u65B0\u53D1\u9001\u8BF7\u6C42\u3002");
+    }
+    try {
+      return await node2("reply", { ...request, useStagedImages: true }, msg);
+    } catch (err) {
+      if (err.code !== "INVALID_IMAGE") throw err;
+      try {
+        await node2("reply/images/clear", { requestId: request.requestId, generation: request.generation }, msg);
+      } catch {
+      }
+      try {
+        await node2("reject", { requestId: request.requestId, code: "IMAGE_UPLOAD_FAILED" }, msg);
+      } catch {
+      }
+      fail("IMAGE_UPLOAD_FAILED", "\u56FE\u7247\u5206\u5757\u6821\u9A8C\u5931\u8D25\uFF0C\u5C1A\u672A\u53D1\u9001\u56DE\u590D\uFF0C\u8BF7\u8BA9\u5FAE\u4FE1\u7528\u6237\u91CD\u65B0\u53D1\u9001\u8BF7\u6C42\u3002");
+    }
+  }
+
   // src/main.mjs
+  var inboundImages = new InboundImages();
   var channel = new BroadcastChannel("wechat-companion-control-v1");
   var config = { schemaVersion: 1, bots: [] };
   var controlTail = Promise.resolve();
@@ -291,13 +452,16 @@
       method,
       params,
       timeoutMs: method === "reply" || method === "auth/check" ? 12e4 : 45e3,
+      ...method === "reply" ? { maxTotalMs: 24e4 } : {},
       ...msg ? { callId: msg.callId, cancelWithCall: true } : {}
     });
     return unwrapNode(response);
   }
   var router = new ReplyRouter({
     targets: cindy.targets,
-    nodeReply: (params, msg) => node("reply", params, msg),
+    tasks: cindy.tasks,
+    readImages: readGrantedImages,
+    nodeReply: (params, msg) => replyWithImages(node, params, msg),
     rejectInbound: (requestId, code) => node("reject", { requestId, code })
   });
   var store = new StateStore({ fs: (request) => cindy.fs(request), node });
@@ -320,6 +484,7 @@
     activeInstance = state.instanceId;
     router.reset();
     router.setConfig(config);
+    inboundImages.clear();
     await node("configure", { bots: config.bots });
     try {
       await ensureVault(fetch);
@@ -345,6 +510,10 @@
     for (const bot of next.bots.filter((bot2) => bot2.enabled)) await cindy.targets.resolve({ target: { kind: "bot", id: bot.companionId } });
     const response = await fetch("/kv", { method: "PUT", body: JSON.stringify(next) });
     if (!response.ok) fail("CONFIG_SAVE_FAILED", "\u914D\u7F6E\u4FDD\u5B58\u5931\u8D25\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002");
+    for (const bot of config.bots) {
+      const replacement = next.bots.find((item) => item.id === bot.id);
+      if (!replacement?.enabled || replacement.companionId !== bot.companionId) inboundImages.clear(bot.id);
+    }
     config = next;
     router.setConfig(config);
     const applied = await node("configure", { bots: config.bots });
@@ -370,7 +539,7 @@
     } catch (err) {
       capabilityError = { code: err.code ?? "TARGET_UNAVAILABLE", message: "\u4F19\u4F34\u5217\u8868\u4E0D\u53EF\u7528\uFF0C\u4ECD\u53EF\u505C\u7528\u6216\u5220\u9664\u5DF2\u6709\u7ED1\u5B9A\u3002" };
     }
-    return { plugin: { id: "wechat-companion", name: "\u5FAE\u4FE1\u4F19\u4F34", version: "0.1.3" }, config, runtime, companions, recoveryError, capabilityError, storageWarning: store.lastWarning };
+    return { plugin: { id: "wechat-companion", name: "\u5FAE\u4FE1\u4F19\u4F34", version: "0.2.0" }, config, runtime, companions, recoveryError, capabilityError, storageWarning: store.lastWarning };
   }
   async function command(action, args = {}, msg) {
     await init();
@@ -402,6 +571,7 @@
         return result;
       }
       case "disconnect_bot":
+        inboundImages.clear(args.id);
         return store.disconnect(args.id, (state) => router.cancelBot(args.id, state.generation), msg);
       case "cancel_login":
         return node("auth/cancel", { id: args.id }, msg);
@@ -438,6 +608,7 @@
       if (msg.state === "crashed" || msg.state === "stopped") {
         restoreWanted = true;
         activeInstance = null;
+        inboundImages.clear();
       }
       if (msg.state === "starting" && restoreWanted && !booting) void init().catch(() => {
       });
@@ -446,6 +617,19 @@
     if (msg.type === "event" && msg.name === "node-notification" && msg.params?.instanceId !== activeInstance) return;
     if (msg.type === "event" && msg.name === "node-notification" && msg.method === "wechat/connection-reset") {
       router.cancelBot(msg.params.botConfigId, msg.params.generation);
+      inboundImages.clear(msg.params.botConfigId);
+      return;
+    }
+    if (msg.type === "event" && msg.name === "node-notification" && msg.method === "wechat/image-chunk") {
+      try {
+        inboundImages.add(msg.params);
+      } catch (err) {
+        inboundImages.drop(msg.params.requestId);
+        try {
+          await node("reject", { requestId: msg.params.requestId, code: err.code ?? "INVALID_IMAGE" });
+        } catch {
+        }
+      }
       return;
     }
     if (msg.type === "event" && msg.name === "node-notification" && msg.method === "wechat/state-changed") {
@@ -466,8 +650,11 @@
     if (msg.type === "event" && msg.name === "node-notification" && msg.method === "wechat/inbound") {
       try {
         await init();
-        await router.receive(msg.params);
+        const { imageParts, ...event } = msg.params;
+        if (imageParts) event.attachments = inboundImages.take(msg.params);
+        await router.receive(event);
       } catch (err) {
+        inboundImages.drop(msg.params?.requestId);
         try {
           await node("reject", { requestId: msg.params?.requestId, code: err.code ?? "DISPATCH_FAILED" });
         } catch {
@@ -480,7 +667,7 @@
       await init();
       let result;
       if (msg.tool === "reply_to_wechat") {
-        result = await router.reply(msg.args.request_id, msg.args.text, msg.args.session_context?.session_id, msg);
+        result = await router.reply(msg.args.request_id, msg.args.text, msg.args.session_context?.session_id, msg, msg.args.attachments);
       } else result = await controlled(msg.tool, msg.args, msg);
       const images = result?.qrPngBase64 ? [{ data: result.qrPngBase64 }] : void 0;
       if (images) {

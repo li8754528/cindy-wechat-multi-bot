@@ -1,8 +1,11 @@
 const readline = require('node:readline');
-const { randomUUID } = require('node:crypto');
+const { randomUUID, createHash } = require('node:crypto');
 const QRCode = require('qrcode');
 const { IlinkClient, decodeMessage, tencentUrl, error } = require('./ilink.cjs');
 const { sealState, openState } = require('./state.cjs');
+const { imageBytes, MAX_IMAGE_BYTES } = require('./media.cjs');
+const MAX_PENDING_IMAGE_BYTES = 40 * 1024 * 1024;
+const IMAGE_CHUNK_CHARS = 192 * 1024;
 const pause = (ms, signal) => new Promise(resolve => {
   if (signal?.aborted) return resolve();
   const done = () => { clearTimeout(timer); signal?.removeEventListener('abort', done); resolve(); };
@@ -10,7 +13,7 @@ const pause = (ms, signal) => new Promise(resolve => {
 });
 class BotManager {
   constructor({ notify = () => {}, clientFactory = opts => new IlinkClient(opts), encodeQr = value => QRCode.toBuffer(value, { width: 360, margin: 3 }), checkpoint = async () => {} } = {}) {
-    this.bots = new Map(); this.requests = new Map(); this.notify = notify;
+    this.bots = new Map(); this.requests = new Map(); this.notify = notify; this.pendingImageBytes = 0;
     this.clientFactory = clientFactory; this.encodeQr = encodeQr;
     this.checkpoint = checkpoint; this.storageStatus = 'not-saved'; this.initialized = false;
     this.instanceId = randomUUID();
@@ -36,7 +39,7 @@ class BotManager {
     state.generation++; state.abort?.abort(); state.loop = null;
     state.authAbort?.abort(); state.auth = undefined; state.authPoll = undefined;
     state.status = state.client ? 'paused' : 'disconnected';
-    for (const [id, entry] of this.requests) if (entry.botConfigId === state.config.id) this.requests.delete(id);
+    for (const [id, entry] of this.requests) if (entry.botConfigId === state.config.id) { this.releaseImages(entry); this.clearStaged(entry); this.requests.delete(id); }
   }
   disconnect(id) {
     const state = this.bot(id);
@@ -159,6 +162,7 @@ class BotManager {
         const result = await state.client.updates(state.cursor, signal);
         if (signal.aborted || state.generation !== generation) return;
         if (result.msgs !== undefined && (!Array.isArray(result.msgs) || result.msgs.length > 100)) throw error('BAD_RESPONSE', '微信消息列表无效或过大。');
+        if (result.msgs?.length || failures) state.lastErrorCode = null;
         const previousCursor = state.cursor, batch = [];
         for (const raw of result.msgs ?? []) { const event = this.ingest(state, generation, raw, false); if (event) batch.push(event); }
         if (typeof result.get_updates_buf === 'string') state.cursor = result.get_updates_buf;
@@ -168,8 +172,17 @@ class BotManager {
           }
         }
         if (signal.aborted || state.generation !== generation) return;
-        for (const event of batch) this.notify('wechat/inbound', event);
-        failures = 0; state.status = 'connected'; state.lastErrorCode = null;
+        for (const event of batch) {
+          try {
+            const prepared = await this.prepareInbound(event, signal);
+            if (signal.aborted || state.generation !== generation) return;
+            this.notifyInbound(prepared);
+          } catch (err) {
+            if (signal.aborted || state.generation !== generation) return;
+            this.reject(event.requestId, err.code ?? 'IMAGE_DOWNLOAD_FAILED');
+          }
+        }
+        failures = 0; state.status = 'connected';
         await pause(200, signal);
       } catch (err) {
         if (signal.aborted) return;
@@ -185,52 +198,136 @@ class BotManager {
   }
   ingest(state, generation, raw, emit = true) {
     const message = decodeMessage(raw); if (!message || state.seen.has(message.id)) return;
-    for (const [id, entry] of this.requests) if (Date.now() - entry.createdAt > 30 * 60000) this.requests.delete(id);
+    for (const [id, entry] of this.requests) if (Date.now() - entry.createdAt > 30 * 60000) { this.releaseImages(entry); this.clearStaged(entry); this.requests.delete(id); }
     const requestId = randomUUID();
     const entry = { ...message, requestId, botConfigId: state.config.id, generation, state: 'pending', createdAt: Date.now() };
     const count = [...this.requests.values()].filter(item => item.botConfigId === state.config.id && item.state === 'pending').length;
     if (count >= 32 || this.requests.size >= 256) { state.lastErrorCode = 'INBOX_FULL'; return; }
     state.seen.add(message.id); if (state.seen.size > 512) state.seen.delete(state.seen.values().next().value);
     this.requests.set(requestId, entry); state.stats.received++;
-    if (message.unsupported || !message.text.trim() || message.text.length > 16000) {
-      state.stats.rejected++; entry.state = 'rejected'; state.lastErrorCode = 'UNSUPPORTED_MESSAGE'; return;
+    if (message.unsupported || (!message.text.trim() && !message.images.length) || message.text.length > 16000) {
+      state.stats.rejected++; entry.state = 'rejected'; state.lastErrorCode = message.errorCode ?? 'UNSUPPORTED_MESSAGE'; return;
     }
-    const event = { requestId, botConfigId: state.config.id, generation, instanceId: this.instanceId, text: message.text };
-    if (emit) this.notify('wechat/inbound', event); return event;
+    const event = { requestId, botConfigId: state.config.id, generation, instanceId: this.instanceId, text: message.text.trim() ? message.text : '请查看微信用户发送的图片。' };
+    if (emit && !message.images.length) this.notify('wechat/inbound', event);
+    else if (emit) void this.prepareInbound(event, state.abort?.signal).then(prepared => this.notifyInbound(prepared), err => this.reject(requestId, err.code ?? 'IMAGE_DOWNLOAD_FAILED'));
+    return event;
+  }
+  releaseImages(entry) { this.pendingImageBytes -= entry.mediaBytes ?? 0; entry.mediaBytes = 0; entry.images = []; }
+  notifyInbound(event) {
+    const { attachments, ...metadata } = event;
+    for (let index = 0; index < (attachments?.length ?? 0); index++) {
+      const data = attachments[index].base64;
+      for (let offset = 0, seq = 0; offset < data.length; offset += IMAGE_CHUNK_CHARS, seq++)
+        this.notify('wechat/image-chunk', { requestId: event.requestId, botConfigId: event.botConfigId, generation: event.generation, instanceId: this.instanceId,
+          index, seq, base64: data.slice(offset, offset + IMAGE_CHUNK_CHARS) });
+    }
+    this.notify('wechat/inbound', { ...metadata, ...(attachments?.length ? { imageParts: attachments.map(item => ({ name: item.name, chars: item.base64.length, chunks: Math.ceil(item.base64.length / IMAGE_CHUNK_CHARS) })) } : {}) });
+  }
+  stagedEntry({ requestId, generation }) {
+    const entry = this.requests.get(requestId), state = entry && this.bots.get(entry.botConfigId);
+    if (!entry || Date.now() - entry.createdAt > 30 * 60000) throw error('REQUEST_EXPIRED', '图片回传请求已过期。');
+    if (!state?.client || !state.config.enabled || state.generation !== generation || entry.generation !== generation) throw error('BINDING_CHANGED', '图片回传绑定已改变。');
+    if (entry.state !== 'pending') throw error('REQUEST_REJECTED', '图片回传请求已结束。');
+    return entry;
+  }
+  clearStaged(entry) { this.pendingImageBytes -= entry.stagedBytes ?? 0; entry.stagedBytes = 0; entry.stagedImages = undefined; entry.stagedLengths = undefined; }
+  stageBegin(args) {
+    const entry = this.stagedEntry(args), lengths = args.lengths;
+    if (!Array.isArray(lengths) || !lengths.length || lengths.length > 4 || lengths.some(length => !Number.isInteger(length) || length < 4 || length % 4 || length > Math.ceil(MAX_IMAGE_BYTES / 3) * 4))
+      throw error('INVALID_IMAGE', '图片分块长度无效。');
+    this.clearStaged(entry);
+    this.releaseImages(entry); // Incoming bytes already belong to the companion's durable message.
+    if (this.pendingImageBytes + lengths.length * MAX_IMAGE_BYTES > MAX_PENDING_IMAGE_BYTES) throw error('MEDIA_INBOX_FULL', '等待传输的图片过多，请稍后重新发送请求。');
+    entry.stagedBytes = lengths.length * MAX_IMAGE_BYTES; this.pendingImageBytes += entry.stagedBytes;
+    entry.stagedLengths = lengths; entry.stagedImages = lengths.map(() => []); return { ready: true };
+  }
+  stageChunk(args) {
+    const entry = this.stagedEntry(args), chunks = entry.stagedImages?.[args.index];
+    if (!Number.isInteger(args.index) || !chunks || !Number.isInteger(args.seq) || args.seq !== chunks.length ||
+        typeof args.base64 !== 'string' || !args.base64 || args.base64.length > IMAGE_CHUNK_CHARS || args.base64.length % 4 || !/^[A-Za-z0-9+/]+={0,2}$/.test(args.base64) ||
+        (chunks.length && chunks.at(-1).includes('=')) || chunks.length * IMAGE_CHUNK_CHARS + args.base64.length > entry.stagedLengths[args.index])
+      throw error('INVALID_IMAGE', '图片分块顺序或内容无效。');
+    chunks.push(args.base64); return { accepted: true };
+  }
+  async prepareInbound(event, signal) {
+    const entry = this.requests.get(event.requestId), state = this.bots.get(event.botConfigId);
+    const current = () => entry && entry.state === 'pending' && this.requests.get(event.requestId) === entry &&
+      state?.config.enabled && state.generation === event.generation && !signal?.aborted;
+    if (!current()) throw error('BINDING_CHANGED', '绑定已改变，不能转交旧图片。');
+    const attachments = [];
+    // Reserve each download's maximum size before awaiting it; includes concurrent Bots.
+    for (const item of entry.images) {
+      if (this.pendingImageBytes + MAX_IMAGE_BYTES > MAX_PENDING_IMAGE_BYTES) throw error('MEDIA_INBOX_FULL', '等待处理的微信图片过多，请稍后重新发送。');
+      this.pendingImageBytes += MAX_IMAGE_BYTES; entry.mediaBytes = (entry.mediaBytes ?? 0) + MAX_IMAGE_BYTES;
+      const attachment = await state.client.downloadImage(item, signal);
+      if (!current()) throw error('BINDING_CHANGED', '绑定已改变，不能转交旧图片。');
+      attachments.push(attachment);
+    }
+    return { ...event, ...(attachments.length ? { attachments } : {}) };
   }
   reject(requestId, code) {
     const entry = this.requests.get(requestId); if (!entry) return { rejected: false };
+    if (entry.state === 'rejected') return { rejected: false };
+    this.releaseImages(entry);
+    this.clearStaged(entry);
     entry.state = 'rejected'; const state = this.bots.get(entry.botConfigId);
     if (state) { state.stats.rejected++; state.lastErrorCode = /^[A-Z_]+$/.test(code ?? '') ? code : 'DISPATCH_FAILED'; }
     return { rejected: true };
   }
-  async reply({ requestId, generation, text }) {
+  async reply({ requestId, generation, text = '', images = [], useStagedImages = false }) {
     const entry = this.requests.get(requestId);
     if (!entry || Date.now() - entry.createdAt > 30 * 60000) throw error('REQUEST_EXPIRED', '回传请求不存在或过期。');
     const state = this.bot(entry.botConfigId);
     if (!state.config.enabled || !state.client || state.generation !== entry.generation || generation !== entry.generation)
       throw error('BINDING_CHANGED', 'Bot 已停用、重连或更换绑定。');
-    if (typeof text !== 'string' || !text.trim() || text.length > 8000) throw error('INVALID_REPLY', '回复必须是 1–8000 字符。');
-    if (entry.replyText !== undefined) {
-      if (entry.replyText !== text) throw error('REPLY_CONFLICT', '不能为同一消息发送不同回复。');
+    if (useStagedImages) {
+      if (entry.replyKey !== undefined && entry.replyHadStaged) {
+        if (entry.replyText !== text) throw error('REPLY_CONFLICT', '不能为同一消息发送不同回复。');
+        this.clearStaged(entry);
+        return entry.replyPromise;
+      }
+      if (!entry.stagedImages || entry.stagedImages.some((chunks, index) => chunks.join('').length !== entry.stagedLengths[index]))
+        throw error('INVALID_IMAGE', '图片分块尚未完整交接。');
+      images = entry.stagedImages.map(chunks => chunks.join(''));
+    }
+    if (typeof text !== 'string' || text.length > 8000 || !Array.isArray(images) || images.length > 4 || (!text.trim() && !images.length))
+      throw error('INVALID_REPLY', '回复须包含文字或 1–4 张图片，文字最多 8000 字符。');
+    const buffers = images.map(imageBytes);
+    const replyKey = JSON.stringify([text, buffers.map(bytes => createHash('sha256').update(bytes).digest('hex'))]);
+    if (entry.replyKey !== undefined) {
+      if (entry.replyKey !== replyKey) throw error('REPLY_CONFLICT', '不能为同一消息发送不同回复。');
       return entry.replyPromise;
     }
     if (entry.state !== 'pending') throw error('REQUEST_REJECTED', '这条微信消息未被受理。');
-    entry.replyText = text; entry.state = 'sending';
+    entry.replyKey = replyKey; entry.replyText = text; entry.replyHadStaged = useStagedImages; entry.state = 'sending';
     const chunks = []; let chunk = '';
     for (const char of text) { if (chunk.length + char.length > 3500) { chunks.push(chunk); chunk = ''; } chunk += char; }
     if (chunk) chunks.push(chunk);
     entry.replyPromise = (async () => {
+      let sendAttempted = false;
+      const signal = state.abort?.signal ? AbortSignal.any([state.abort.signal, AbortSignal.timeout(210000)]) : AbortSignal.timeout(210000);
+      const assertCurrent = () => { if (state.generation !== generation || !state.config.enabled || signal.aborted) throw error('BINDING_CHANGED', '发送期间绑定改变或请求取消。'); };
       try {
+      // Upload the complete image set before sending text, avoiding a partial reply on upload failure.
+      const uploaded = [];
+      for (const bytes of buffers) { assertCurrent(); this.notify('wechat/reply-progress', { requestId, instanceId: this.instanceId }); uploaded.push(await state.client.uploadImage(entry.peerId, bytes, signal)); }
       for (const chunk of chunks) {
-        if (state.generation !== generation || !state.config.enabled) throw error('BINDING_CHANGED', '发送期间绑定改变。');
-        await state.client.send({ peerId: entry.peerId, contextToken: entry.contextToken, clientId: randomUUID(), text: chunk }, state.abort?.signal);
+        assertCurrent(); sendAttempted = true;
+        if (buffers.length) this.notify('wechat/reply-progress', { requestId, instanceId: this.instanceId });
+        await state.client.send({ peerId: entry.peerId, contextToken: entry.contextToken, clientId: randomUUID(), text: chunk }, signal);
       }
-      entry.state = 'sent'; state.stats.delivered++; return { delivered: true, requestId, chunks: chunks.length };
-      } catch {
+      for (const image of uploaded) {
+        assertCurrent(); sendAttempted = true;
+        this.notify('wechat/reply-progress', { requestId, instanceId: this.instanceId });
+        await state.client.sendImage({ peerId: entry.peerId, contextToken: entry.contextToken, clientId: randomUUID(), image }, signal);
+      }
+      entry.state = 'sent'; state.stats.delivered++; return { delivered: true, requestId, chunks: chunks.length, images: uploaded.length };
+      } catch (err) {
+      if (!sendAttempted) { entry.state = 'rejected'; state.lastErrorCode = err.code ?? 'IMAGE_UPLOAD_FAILED'; throw error('IMAGE_UPLOAD_FAILED', '图片准备或上传失败，尚未发送回复，请让微信用户重新发送请求。'); }
       entry.state = 'uncertain'; state.lastErrorCode = 'DELIVERY_UNCERTAIN';
       throw error('DELIVERY_UNCERTAIN', '微信发送结果不确定；请在微信检查，不能自动重发。');
-      }
+      } finally { this.releaseImages(entry); this.clearStaged(entry); }
     })();
     return entry.replyPromise;
   }
@@ -270,6 +367,9 @@ function serve() {
         case 'disconnect/rollback': result = manager.rollbackDisconnect(args.id); break;
         case 'auth/cancel': result = manager.cancelAuth(args.id); break;
         case 'reply': result = await manager.reply(args); break;
+        case 'reply/images/begin': result = manager.stageBegin(args); break;
+        case 'reply/images/chunk': result = manager.stageChunk(args); break;
+        case 'reply/images/clear': { manager.clearStaged(manager.stagedEntry(args)); result = { cleared: true }; break; }
         case 'reject': result = manager.reject(args.requestId, args.code); break;
         default: throw error('METHOD_NOT_FOUND', 'Node 方法不存在。');
       }

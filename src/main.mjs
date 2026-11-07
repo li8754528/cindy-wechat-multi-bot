@@ -1,5 +1,8 @@
 import { ReplyRouter, validateConfig, fail } from './core.mjs';
 import { StateStore, ensureVault, unwrapNode } from './persistence.mjs';
+import { readGrantedImages } from './handoff.mjs';
+import { InboundImages, replyWithImages } from './transfer.mjs';
+const inboundImages = new InboundImages();
 const channel = new BroadcastChannel('wechat-companion-control-v1');
 let config = { schemaVersion: 1, bots: [] };
 let controlTail = Promise.resolve();
@@ -8,11 +11,12 @@ let activeInstance = null;
 const uiCalls = new Map();
 async function node(method, params = {}, msg) {
   const response = await cindy.node.request({ method, params, timeoutMs: method === 'reply' || method === 'auth/check' ? 120000 : 45000,
+    ...(method === 'reply' ? { maxTotalMs: 240000 } : {}),
     ...(msg ? { callId: msg.callId, cancelWithCall: true } : {}) });
   return unwrapNode(response);
 }
-const router = new ReplyRouter({ targets: cindy.targets,
-  nodeReply: (params, msg) => node('reply', params, msg), rejectInbound: (requestId, code) => node('reject', { requestId, code }) });
+const router = new ReplyRouter({ targets: cindy.targets, tasks: cindy.tasks, readImages: readGrantedImages,
+  nodeReply: (params, msg) => replyWithImages(node, params, msg), rejectInbound: (requestId, code) => node('reject', { requestId, code }) });
 const store = new StateStore({ fs: request => cindy.fs(request), node });
 async function targetsReady() {
   if (typeof cindy.targets?.capabilities !== 'function') fail('UNSUPPORTED_CAPABILITY', '当前 Cindy 不支持指定伙伴，请更新宿主。');
@@ -26,7 +30,7 @@ async function boot() {
 }
 async function bindInstance(state, force = false) {
   if (!force && state.instanceId === activeInstance) return;
-  activeInstance = state.instanceId; router.reset(); router.setConfig(config);
+  activeInstance = state.instanceId; router.reset(); router.setConfig(config); inboundImages.clear();
   await node('configure', { bots: config.bots });
   try { await ensureVault(fetch); await store.restore(); recoveryError = null; }
   catch (err) { recoveryError = { code: err.code ?? 'PERSISTENCE_FAILED', message: err.code ? err.message : '恢复登录失败，请检查插件设置。' }; }
@@ -44,6 +48,10 @@ async function save(next) {
   for (const bot of next.bots.filter(bot => bot.enabled)) await cindy.targets.resolve({ target: { kind: 'bot', id: bot.companionId } });
   const response = await fetch('/kv', { method: 'PUT', body: JSON.stringify(next) });
   if (!response.ok) fail('CONFIG_SAVE_FAILED', '配置保存失败，请稍后重试。');
+  for (const bot of config.bots) {
+    const replacement = next.bots.find(item => item.id === bot.id);
+    if (!replacement?.enabled || replacement.companionId !== bot.companionId) inboundImages.clear(bot.id);
+  }
   config = next; router.setConfig(config); const applied = await node('configure', { bots: config.bots }); await bindInstance(applied);
   if (recoveryError && !config.bots.length) { await store.clear(); await node('state/initialize'); }
   else if (recoveryError) return snapshot();
@@ -56,7 +64,7 @@ async function snapshot() {
   let companions = [], capabilityError = null;
   try { companions = (await cindy.targets.list({ targetKind: 'bot' })).targets; }
   catch (err) { capabilityError = { code: err.code ?? 'TARGET_UNAVAILABLE', message: '伙伴列表不可用，仍可停用或删除已有绑定。' }; }
-  return { plugin: { id: 'wechat-companion', name: '微信伙伴', version: '0.1.3' }, config, runtime, companions, recoveryError, capabilityError, storageWarning: store.lastWarning };
+  return { plugin: { id: 'wechat-companion', name: '微信伙伴', version: '0.2.0' }, config, runtime, companions, recoveryError, capabilityError, storageWarning: store.lastWarning };
 }
 async function command(action, args = {}, msg) {
   await init();
@@ -81,7 +89,9 @@ async function command(action, args = {}, msg) {
       if (result.status === 'storage_error') { await store.flush(); return (await node('status')).bots.find(bot => bot.id === args.id); }
       return result;
     }
-    case 'disconnect_bot': return store.disconnect(args.id, state => router.cancelBot(args.id, state.generation), msg);
+    case 'disconnect_bot':
+      inboundImages.clear(args.id);
+      return store.disconnect(args.id, state => router.cancelBot(args.id, state.generation), msg);
     case 'cancel_login': return node('auth/cancel', { id: args.id }, msg);
     case 'retry_save': await ensureVault(fetch); await store.flush(); recoveryError = null; return snapshot();
     default: fail('UNKNOWN_ACTION', '此操作不存在。');
@@ -104,13 +114,20 @@ channel.onmessage = async ({ data }) => {
 };
 cindy.onHostMessage(async msg => {
   if (msg.type === 'event' && msg.name === 'node-status') {
-    if (msg.state === 'crashed' || msg.state === 'stopped') { restoreWanted = true; activeInstance = null; }
+    if (msg.state === 'crashed' || msg.state === 'stopped') { restoreWanted = true; activeInstance = null; inboundImages.clear(); }
     if (msg.state === 'starting' && restoreWanted && !booting) void init().catch(() => {});
     return;
   }
   if (msg.type === 'event' && msg.name === 'node-notification' && msg.params?.instanceId !== activeInstance) return;
   if (msg.type === 'event' && msg.name === 'node-notification' && msg.method === 'wechat/connection-reset') {
-    router.cancelBot(msg.params.botConfigId, msg.params.generation); return;
+    router.cancelBot(msg.params.botConfigId, msg.params.generation); inboundImages.clear(msg.params.botConfigId); return;
+  }
+  if (msg.type === 'event' && msg.name === 'node-notification' && msg.method === 'wechat/image-chunk') {
+    try { inboundImages.add(msg.params); } catch (err) {
+      inboundImages.drop(msg.params.requestId);
+      try { await node('reject', { requestId: msg.params.requestId, code: err.code ?? 'INVALID_IMAGE' }); } catch {}
+    }
+    return;
   }
   if (msg.type === 'event' && msg.name === 'node-notification' && msg.method === 'wechat/state-changed') {
     let ok = false;
@@ -120,7 +137,13 @@ cindy.onHostMessage(async msg => {
     return;
   }
   if (msg.type === 'event' && msg.name === 'node-notification' && msg.method === 'wechat/inbound') {
-    try { await init(); await router.receive(msg.params); } catch (err) {
+    try {
+      await init();
+      const { imageParts, ...event } = msg.params;
+      if (imageParts) event.attachments = inboundImages.take(msg.params);
+      await router.receive(event);
+    } catch (err) {
+      inboundImages.drop(msg.params?.requestId);
       try { await node('reject', { requestId: msg.params?.requestId, code: err.code ?? 'DISPATCH_FAILED' }); } catch {}
     }
     return;
@@ -129,7 +152,7 @@ cindy.onHostMessage(async msg => {
   try {
     await init(); let result;
     if (msg.tool === 'reply_to_wechat') {
-      result = await router.reply(msg.args.request_id, msg.args.text, msg.args.session_context?.session_id, msg);
+      result = await router.reply(msg.args.request_id, msg.args.text, msg.args.session_context?.session_id, msg, msg.args.attachments);
     } else result = await controlled(msg.tool, msg.args, msg);
     const images = result?.qrPngBase64 ? [{ data: result.qrPngBase64 }] : undefined;
     if (images) { const { qrPngBase64, ...metadata } = result; result = metadata; }
