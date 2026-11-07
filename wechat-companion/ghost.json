@@ -1,0 +1,212 @@
+{
+  "schemaVersion": 3,
+  "minCindyVersion": "0.1.128",
+  "id": "wechat-companion",
+  "name": "微信伙伴",
+  "description": "一个插件管理多个微信 Bot，每个固定绑定一个 Cindy 伙伴，收发对应文字消息。登录通过 Cindy 保险库和加密文件安全保存，重启自动恢复，凭证失效时才需重新登录。",
+  "whenToUse": "配置微信 Bot 与伙伴绑定、扫码登录、查看连接状态，或回复微信伙伴转交的消息时使用。",
+  "version": "0.1.3",
+  "entry": "main.js",
+  "command": "微信伙伴",
+  "showTaskPreferences": false,
+  "launch": "resident",
+  "settingsHtml": "settings.html",
+  "panel": {
+    "html": "settings.html",
+    "position": "tab",
+    "title": "微信伙伴"
+  },
+  "agent": {
+    "tasks": true,
+    "targets": true,
+    "delegation": true
+  },
+  "sessionContext": true,
+  "fs": true,
+  "setup": {
+    "requires": []
+  },
+  "node": {
+    "entry": "node/worker.cjs",
+    "protocol": "json-rpc-stdio",
+    "lifecycle": "resident",
+    "secretBindings": [
+      {
+        "key": "wechat_vault_key",
+        "label": "微信登录加密密钥（自动生成）",
+        "methods": [
+          "state/load",
+          "state/seal"
+        ],
+        "hint": "由插件自动生成并保存至 Cindy 保险库，仅用于加密本插件的微信登录记录。"
+      }
+    ]
+  },
+  "manual": {
+    "items": [
+      {
+        "dir": "manual/getting-started",
+        "name": "getting-started",
+        "description": "添加绑定、扫码登录、验证收发，以及仅回传对应微信请求的答案。"
+      }
+    ]
+  },
+  "tools": [
+    {
+      "name": "list_bindings",
+      "description": "列出配置、连接状态和本机可用伙伴；不返回凭证或消息正文。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "upsert_binding",
+      "description": "新增或修改一对一绑定，每个伙伴只能绑定一组；新绑定默认不启用，修改时省略 enabled 保留原状态。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "1–48 位字母、数字、下划线或连字符配置标识"
+          },
+          "name": {
+            "type": "string",
+            "description": "这组 Bot 显示名称"
+          },
+          "companion_id": {
+            "type": "string",
+            "description": "从 list_bindings 伙伴列表选取的 ID"
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "是否启用收发；新绑定默认 false，修改时省略则保留原状态"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "companion_id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "delete_binding",
+      "description": "删除本组配置并断开连接，不删除伙伴。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Bot 配置标识"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "begin_login",
+      "description": "生成扫码登录二维码；只开始登录，扫码后调用 check_login 核实结果。不返回凭证。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Bot 配置标识"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "check_login",
+      "description": "核实扫码结果，登录确认后按启用配置开始收发。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Bot 配置标识"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "disconnect_bot",
+      "description": "断开本组并清除内存及保存的登录，其他 Bot 不受影响。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Bot 配置标识"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "reply_to_wechat",
+      "description": "回传当前微信请求的答案；仅接收此消息的伙伴可调用。收件人由原请求确定，同请求同回复不会重复发送，不得发送其他对话或历史。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "description": "桥接消息里的回传请求编号"
+          },
+          "text": {
+            "type": "string",
+            "description": "仅针对此次微信消息的回复，1–8000 字符"
+          }
+        },
+        "required": [
+          "request_id",
+          "text"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "cancel_login",
+      "description": "取消本次扫码，保留已有登录和连接，不清除保存记录。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Bot 配置标识"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "retry_save",
+      "description": "用户确认后重试保存已确认的登录，不重发微信消息。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    }
+  ]
+}

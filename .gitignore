@@ -1,0 +1,10 @@
+node_modules/
+.logs/
+.research/
+github-result-*.json
+source-*.json
+api-*.json
+*.cindy
+*.log
+.env*
+!*.example

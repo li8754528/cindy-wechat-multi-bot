@@ -1,0 +1,15 @@
+body { margin: 0; padding: 14px; font: 14px/1.6 system-ui, sans-serif; }
+p { margin: 0 0 12px; }
+form, .bot, section { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border-default); }
+label { display: grid; gap: 5px; margin: 9px 0; }
+input, select, button { box-sizing: border-box; min-width: 0; max-width: 100%; font: inherit; color: inherit; border: 1px solid var(--border-default); border-radius: 7px; padding: 7px 9px; background: var(--surface); }
+input, select { width: 100%; }
+button { cursor: pointer; }
+button:disabled { cursor: wait; opacity: .55; }
+.inline { display: flex; align-items: center; gap: 8px; }
+.inline input { width: auto; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+.meta { color: var(--text-secondary); overflow-wrap: anywhere; }
+#notice { overflow-wrap: anywhere; }
+#notice.error { color: var(--text-danger, var(--text-primary)); }
+#qr { display: block; width: 100%; max-width: 280px; height: auto; margin: 10px 0; }
