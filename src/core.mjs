@@ -33,10 +33,15 @@ export class ReplyRouter {
     this.tasks = tasks; this.readImages = readImages; this.beforeDispatch = beforeDispatch;
     this.setTimer = setTimer; this.clearTimer = clearTimer; this.now = now;
     this.routes = new Map(); this.requests = new Map(); this.lanes = new Map(); this.current = new Map(); this.generations = new Map();
+    this.inboundTails = new Map(); this.inboundEpochs = new Map(); this.resetEpoch = 0;
     this.bindingSessions = new Map(); this.replyCalls = new Map(); this.sendCalls = new Map();
   }
   setConfig(config) {
     const next = new Map(config.bots.map(bot => [bot.id, bot]));
+    for (const [id, route] of this.routes) {
+      const replacement = next.get(id);
+      if (!replacement?.enabled || replacement.companionId !== route.companionId) this.invalidateInbound(id);
+    }
     for (const id of this.routes.keys()) if (!next.has(id)) { this.cancelBot(id); this.generations.delete(id); }
     for (const entry of this.requests.values()) {
       const route = next.get(entry.botConfigId);
@@ -45,6 +50,7 @@ export class ReplyRouter {
     this.routes = next;
   }
   reset() {
+    this.resetEpoch++; this.inboundTails.clear(); this.inboundEpochs.clear();
     for (const entry of this.requests.values()) { entry.state = 'cancelled'; entry.finish?.(); }
     this.requests.clear(); this.lanes.clear(); this.current.clear(); this.generations.clear();
     this.bindingSessions.clear(); this.replyCalls.clear(); this.sendCalls.clear();
@@ -57,14 +63,97 @@ export class ReplyRouter {
     if (!callId) return; this.replyCalls.set(callId, record);
     if (this.replyCalls.size > 512) this.replyCalls.delete(this.replyCalls.keys().next().value);
   }
-  cancelBot(botConfigId, generation) {
+  invalidateInbound(botId) {
+    this.inboundTails.delete(botId);
+    this.inboundEpochs.set(botId, (this.inboundEpochs.get(botId) ?? 0) + 1);
+  }
+  cancelBot(botConfigId, generation, detachInbound = true) {
+    if (detachInbound) this.invalidateInbound(botConfigId);
     for (const [id, entry] of this.requests) if (entry.botConfigId === botConfigId) {
       entry.state = 'cancelled'; entry.finish?.(); this.requests.delete(id);
     }
     this.lanes.delete(botConfigId); this.current.delete(botConfigId);
     if (Number.isInteger(generation)) this.generations.set(botConfigId, Math.max(generation, this.generations.get(botConfigId) ?? 0));
   }
-  async receive(message) {
+  serializeInbound(botId, action) {
+    const epoch = this.resetEpoch, botEpoch = this.inboundEpochs.get(botId);
+    const pending = (this.inboundTails.get(botId) ?? Promise.resolve()).then(() => {
+      if (epoch !== this.resetEpoch || botEpoch !== this.inboundEpochs.get(botId)) return;
+      return action();
+    });
+    const tail = pending.catch(() => {}); this.inboundTails.set(botId, tail);
+    void tail.then(() => { if (this.inboundTails.get(botId) === tail) this.inboundTails.delete(botId); });
+    return pending;
+  }
+  receive(message) { return this.serializeInbound(message.botConfigId, () => this.receiveNow(message)); }
+  async replaceFailed(message) {
+    const blocker = this.requests.get(this.current.get(message.botConfigId));
+    const old = blocker?.state === 'withdrawing'
+      ? [...this.requests.values()].find(entry => entry.botConfigId === message.botConfigId && entry.state === 'queued') : blocker;
+    if (!old || !['retry_wait', 'queued'].includes(old.state) || !message.peerId || old.peerId !== message.peerId || old.generation !== message.generation) return message;
+    // Only fold a contiguous same-user suffix. Never move content across another user's input.
+    const entries = [...this.requests.values()].filter(entry => entry.botConfigId === message.botConfigId &&
+      (entry === old || entry.state === 'queued'));
+    if (entries.some(entry => entry.peerId !== message.peerId || entry.generation !== message.generation)) return message;
+    const signature = part => JSON.stringify([part.text, (part.attachments ?? []).map(image => image.base64)]);
+    const incoming = { text: message.text, attachments: message.attachments };
+    const parts = signature(old) === signature(incoming) && entries.length === 1 ? [incoming]
+      : [...entries.flatMap(entry => entry.parts ?? [{ text: entry.text, attachments: entry.attachments }])
+        .filter(part => signature(part) !== signature(incoming)), incoming];
+    const text = parts.map(part => part.text).join('\n\n');
+    const attachments = [...new Map(parts.flatMap(part => part.attachments ?? []).map(image => [image.base64, image])).values()];
+    if (text.length > 16000 || attachments.length > 4) return message; // Keep both inputs intact and ordered.
+    const oldState = old.state; let withdrawal;
+    if (old.sendAttempted) {
+      if (typeof this.targets.get !== 'function' || typeof this.targets.cancel !== 'function') return message;
+      try {
+        const receipt = await this.targets.get({ requestKey: `wx-${old.requestId}` });
+        if (!(receipt?.found === false || receipt?.found === true && receipt.requestKey === `wx-${old.requestId}` &&
+          receipt.target?.kind === 'bot' && receipt.target.id === old.companionId && receipt.status === 'pending')) return message;
+        try { withdrawal = await this.targets.cancel({ requestKey: `wx-${old.requestId}` }); }
+        catch { /* Cancellation ACK may be lost. Fence the old request until the receipt confirms settlement. */ }
+        withdrawal ??= {};
+        if (withdrawal.cancelled !== true) withdrawal = {};
+      } catch { return message; }
+    }
+    // Configuration/reset can change while awaiting the Host. Do not revive that input.
+    if (old.state !== oldState || this.requests.get(old.requestId) !== old ||
+      this.routes.get(old.botConfigId)?.companionId !== old.companionId || !this.routes.get(old.botConfigId)?.enabled) return message;
+    if (old.retryTimer !== undefined) this.clearTimer(old.retryTimer);
+    old.retryTimer = undefined; old.nextRetryAt = undefined;
+    for (const entry of entries) {
+      if (entry === old && withdrawal && withdrawal.settled !== true) {
+        entry.state = 'withdrawing'; this.scheduleWithdrawal(entry); continue;
+      }
+      entry.state = 'superseded'; entry.finish();
+      void this.rejectInbound(entry.requestId, 'REQUEST_SUPERSEDED').catch(() => {});
+    }
+    if (old.state === 'withdrawing') this.lanes.set(old.botConfigId, old.done);
+    else if (blocker?.state === 'withdrawing') this.lanes.set(blocker.botConfigId, blocker.done);
+    return { ...message, text, ...(attachments.length ? { attachments } : {}), parts };
+  }
+  scheduleWithdrawal(entry) {
+    if (entry.state !== 'withdrawing' || this.requests.get(entry.requestId) !== entry) return;
+    entry.receiptTimer = this.setTimer(async () => {
+      entry.receiptTimer = undefined;
+      try {
+        const receipt = await this.targets.get({ requestKey: `wx-${entry.requestId}` });
+        if (entry.state !== 'withdrawing' || this.requests.get(entry.requestId) !== entry) return;
+        if (receipt?.found === true && receipt.requestKey === `wx-${entry.requestId}` &&
+          receipt.target?.kind === 'bot' && receipt.target.id === entry.companionId && receipt.status === 'cancelled' && receipt.settled === true) {
+          entry.state = 'superseded'; entry.finish();
+          try { await this.rejectInbound(entry.requestId, 'REQUEST_SUPERSEDED'); } catch {}
+          return;
+        }
+      } catch (error) {
+        if (['PERMISSION_DENIED', 'UNSUPPORTED_CAPABILITY', 'INVALID_PARAMS'].includes(error.code)) return;
+        // Wait for reliable withdrawal; never duplicate possibly running work.
+      }
+      this.scheduleWithdrawal(entry);
+    }, [1000, 5000, 15000][Math.min(entry.withdrawalPoll = (entry.withdrawalPoll ?? -1) + 1, 2)]);
+    entry.receiptTimer?.unref?.();
+  }
+  async receiveNow(message) {
     const bot = this.routes.get(message.botConfigId);
     if (!bot?.enabled || typeof message.requestId !== 'string' ||
         typeof message.text !== 'string' || !message.text.trim() || message.text.length > 16000) {
@@ -73,10 +162,17 @@ export class ReplyRouter {
     if (this.requests.has(message.requestId)) return;
     const generation = this.generations.get(message.botConfigId) ?? 0;
     if (message.generation < generation) { await this.rejectInbound(message.requestId, 'STALE_CONNECTION'); return; }
-    if (message.generation > generation) this.cancelBot(message.botConfigId, message.generation);
+    if (message.generation > generation) this.cancelBot(message.botConfigId, message.generation, false);
     for (const [id, old] of this.requests) if (this.now() - old.createdAt > 30 * 60000 &&
-      !(old.state === 'accepted' && old.replyKey !== undefined)) { old.state = 'expired'; old.finish?.(); this.requests.delete(id); }
+      old.state !== 'withdrawing' && !(old.state === 'accepted' && old.replyKey !== undefined)) { old.state = 'expired'; old.finish?.(); this.requests.delete(id); }
     if (this.requests.size >= 256) { await this.rejectInbound(message.requestId, 'INBOX_FULL'); return; }
+    const receiveEpoch = this.resetEpoch, botEpoch = this.inboundEpochs.get(message.botConfigId);
+    message = await this.replaceFailed(message);
+    const currentRoute = this.routes.get(message.botConfigId);
+    if (receiveEpoch !== this.resetEpoch || botEpoch !== this.inboundEpochs.get(message.botConfigId) ||
+      !currentRoute?.enabled || currentRoute.companionId !== bot.companionId || this.generations.get(message.botConfigId) !== message.generation) {
+      await this.rejectInbound(message.requestId, 'BINDING_CHANGED'); return;
+    }
     const entry = { ...message, companionId: bot.companionId, createdAt: this.now(), state: 'queued' };
     this.requests.set(message.requestId, entry);
     const previous = this.lanes.get(entry.botConfigId);
@@ -85,14 +181,14 @@ export class ReplyRouter {
       if (entry.retryTimer !== undefined) this.clearTimer(entry.retryTimer);
       entry.retryTimer = undefined; entry.nextRetryAt = undefined;
       entry.receiptTimer = undefined; entry.monitorReceipt = false;
-      entry.attachments = undefined;
+      entry.attachments = undefined; entry.parts = undefined;
       if (this.current.get(entry.botConfigId) === entry.requestId) this.current.delete(entry.botConfigId);
       if (this.lanes.get(entry.botConfigId) === entry.done) this.lanes.delete(entry.botConfigId); resolve();
     }; });
     this.lanes.set(entry.botConfigId, entry.done);
     const start = entry.start = async () => {
       const route = this.routes.get(entry.botConfigId);
-      if (entry.state === 'cancelled' || !route?.enabled || route.companionId !== entry.companionId) fail('BINDING_CHANGED', '绑定已改变，不能派发旧消息。');
+      if (!['queued', 'retry_wait'].includes(entry.state) || !route?.enabled || route.companionId !== entry.companionId) fail('BINDING_CHANGED', '绑定已改变，不能派发旧消息。');
       if (this.now() - entry.createdAt > 30 * 60000) fail('REQUEST_EXPIRED', '微信请求已过期。');
       this.current.set(entry.botConfigId, entry.requestId); entry.state = 'dispatching'; return this.dispatch(entry);
     };
@@ -101,23 +197,25 @@ export class ReplyRouter {
     if (!previous) await handled; else void handled.catch(() => {});
   }
   pendingRetries() {
-    return [...this.requests.values()].filter(entry => entry.state === 'retry_wait').map(entry => ({
+    return [...this.requests.values()].filter(entry => ['retry_wait', 'withdrawing'].includes(entry.state)).map(entry => ({
       botConfigId: entry.botConfigId, attempt: entry.dispatchRetries, retryAt: entry.nextRetryAt,
+      ...(entry.state === 'withdrawing' ? { withdrawing: true } : {}),
     }));
   }
   async dispatchFailed(entry, error) {
-    if (entry.state === 'cancelled' || this.requests.get(entry.requestId) !== entry) return;
+    if (['cancelled', 'superseded', 'withdrawing'].includes(entry.state) || this.requests.get(entry.requestId) !== entry) return;
     const route = this.routes.get(entry.botConfigId);
     if (!route?.enabled || route.companionId !== entry.companionId) error = { code: 'BINDING_CHANGED' };
     const retry = entry.dispatchRetries ?? 0, delay = DISPATCH_RETRY_DELAYS[retry];
     if (delay !== undefined && !NON_RETRYABLE_DISPATCH.has(error.code)) {
       if (this.now() + delay < entry.createdAt + 30 * 60000) {
         entry.state = 'retry_wait'; entry.dispatchRetries = retry + 1; entry.nextRetryAt = this.now() + delay;
-        entry.retryTimer = this.setTimer(() => {
+        entry.retryTimer = this.setTimer(() => this.serializeInbound(entry.botConfigId, () => {
+          if (entry.state !== 'retry_wait' || this.requests.get(entry.requestId) !== entry) return;
           entry.retryTimer = undefined; entry.nextRetryAt = undefined;
           entry.accepted = entry.start();
           return entry.accepted.catch(nextError => this.dispatchFailed(entry, nextError));
-        }, delay);
+        }), delay);
         entry.retryTimer?.unref?.(); return;
       }
       error = { code: 'REQUEST_EXPIRED' };
@@ -143,6 +241,7 @@ export class ReplyRouter {
     const requestKey = `wx-${entry.requestId}`;
     const route = this.routes.get(entry.botConfigId);
     if (entry.state !== 'dispatching' || !route?.enabled || route.companionId !== entry.companionId) fail('BINDING_CHANGED', '绑定已改变，不能派发旧消息。');
+    entry.sendAttempted = true;
     const receipt = await this.targets.send({ target, requestKey, text: entry.text, delivery: 'queue',
       ...(entry.attachments?.length ? { attachments: entry.attachments } : {}),
       delegation: { task: '处理本次微信用户消息，并且仅将本次回答通过微信伙伴 reply_to_wechat 交回原消息渠道；遵守主人的原有权限与限制。' } });
@@ -150,7 +249,7 @@ export class ReplyRouter {
     if (entry.state !== 'dispatching') fail('BINDING_CHANGED', '派发期间请求已失效，不能回传旧回复。');
     entry.sessionId = receipt.taskId; entry.state = 'accepted';
     this.bindSession(entry.botConfigId, entry.companionId, receipt.taskId);
-    entry.attachments = undefined;
+    entry.attachments = undefined; entry.parts = undefined;
     entry.requestKey = requestKey; entry.executionId = receipt.executionId;
     if (caps.delegation.receiptQuery === true && caps.delegation.settled === true && typeof this.targets.get === 'function') {
       entry.monitorReceipt = true; entry.receiptPoll = 0; this.scheduleReceipt(entry);
@@ -230,6 +329,7 @@ export class ReplyRouter {
     } else if (typeof requestId !== 'string' || !requestId) fail('INVALID_REPLY', 'request_id 须省略或使用原请求编号。');
     const entry = this.requests.get(requestId);
     if (!entry || this.now() - entry.createdAt > 30 * 60000) fail('REQUEST_EXPIRED', '请求不存在或已过期，请让微信用户重新发送。');
+    if (['superseded', 'withdrawing'].includes(entry.state)) fail('REQUEST_SUPERSEDED', '这条请求已由用户的新消息替换或合并，不能回传旧回复。');
     if (entry.state === 'settled') fail('REQUEST_SETTLED', '伙伴已结束本次请求但未回传，不能补发旧回复，请让微信用户重新发送。');
     const bot = this.routes.get(entry.botConfigId);
     if (!bot?.enabled || bot.companionId !== entry.companionId) fail('BINDING_CHANGED', '原绑定已经停用或改变，不能回传旧回复。');

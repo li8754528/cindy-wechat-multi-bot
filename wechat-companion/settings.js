@@ -20,6 +20,7 @@ const messageErrors = { VOICE_UNSUPPORTED: '暂不支持语音，请使用微信
   INTERRUPTED_WITHOUT_REPLY: '最近微信请求：伙伴处理被中断，未回传答案。请在 Cindy 查看状态，再在微信重新发送请求',
   ENDED_WITHOUT_REPLY: '最近微信请求：伙伴已结束本次处理，未回传答案。请在 Cindy 查看状态，需要时在微信重新发送请求',
   REQUEST_EXPIRED: '最近微信请求：请求已过期，不能补发回复。请在微信重新发送请求',
+  REQUEST_SUPERSEDED: '这条旧请求已由同一用户的新消息替换或合并',
   REQUEST_SETTLED: '最近微信请求：请求已结束，不能补发旧回复。请在微信重新发送请求',
   DISPATCH_RETRY_EXHAUSTED: '最近微信请求：转交伙伴失败，已用完两次自动重试，请在微信重新发送',
   DISPATCH_DELIVERY_UNCERTAIN: '最近微信请求：转交伙伴结果仍不确定，已结束两次重试，请先在 Cindy 检查',
@@ -104,7 +105,7 @@ function render() {
     }
     box.append(stats);
     const retry = view.dispatchRetries?.find(item => item.botConfigId === bot.id);
-    if (retry) box.append(element('p', `最近微信请求：转交伙伴失败，将于 ${new Date(retry.retryAt).toLocaleTimeString()} 自动重试（第 ${retry.attempt}/2 次）`, 'bot-error'));
+    if (retry) box.append(element('p', retry.withdrawing ? '新消息已合并，正在核实旧投递已撤回，确认后自动转交伙伴' : `最近微信请求：转交伙伴失败，将于 ${new Date(retry.retryAt).toLocaleTimeString()} 自动重试（第 ${retry.attempt}/2 次）`, 'bot-error'));
     else if (state?.lastErrorCode) box.append(element('p', messageErrors[state.lastErrorCode] ?? `最近连接异常：${state.lastErrorCode}，请刷新状态或重新扫码`, 'bot-error'));
     const guideState = view.bindingGuides?.find(item => item.id === bot.id)?.state ?? 'required';
     if (bot.companionId && guideMessages[guideState]) box.append(element('p', guideMessages[guideState], 'muted'));

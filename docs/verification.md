@@ -2,6 +2,18 @@
 
 目标宿主：本机 Cindy 0.1.128；源码 tag v0.1.128，commit `9d62b213c960c63daa46996de8a606965f2f2299`。
 
+## 0.3.6 失败输入由新消息替换或合并（2026-11-08）
+
+用户随后明确要求更新插件并提交推送。Forge 原位更新回执为 updated、version 0.3.6、namespace local、instanceId _ns__local__wechat-companion、enabled true。运行 list_bindings 确认 0.3.6，瑶瑶/喵喵/璐璐三组原配置、伙伴绑定与已有联系人保留，均 connected，credentialStorage sealed，dispatchRetries 为空，recoveryError/capabilityError/storageWarning 均 null。三组 lastErrorCode 为 TIMEOUT；未据此判定网络或模型根因，也未将连接状态当作真实微信收发验收。本轮未主动发送真实微信。
+
+同一 Bot、同一联系人、同一连接代次的新输入到达时，retry_wait 中的重复内容由新请求替换；不同内容以空行按原顺序合并，相同的重复片段保留最新一次，图片按字节内容去重。使用最新请求编号及其 Node 原始微信上下文回传一次。超过 16000 字符或 4 张图时不截断，保持原队列。已 accepted 的输入不参与合并；Bot/联系人不同不合并，合并不跨越其他联系人排队消息。
+
+send 尚未调用时直接取消本地重试；曾调用则先用旧 wx-requestId 查询回执，found:false 或可靠匹配的 pending 才调用 targets.cancel。cancelled 且 settled 才立即放行；撤回 ACK 丢失或未结算时进入 withdrawing，按 1/5/15 秒退避查询匹配的 cancelled+settled，后续同联系人内容继续暂存合并。权限/不支持/无效查询停止轮询并保持等待；不能确认撤回时不换键盲发，需在 Cindy 查看处理。旧回调、旧请求回传、重置/换绑/重连后的迟到结果不能复活被替换的输入。合并的旧 Node 请求释放图片但不计发送失败。
+
+110/110 自动测试、构建、生成入口语法检查与 git diff --check 通过。覆盖相同替换、不同合并、图片差异/去重、长度/图片数边界、已接受回执/查询失败/缺 cancel、投递中并发新消息、撤回未结算/ACK 丢失、旧计时器/查询迟到、重置/换绑，以及编译 main.js 到真实 BotManager 的合并后仅回复一次、最新 contextToken 和联系人路由验证。此阶段未发送真实微信、未安装或发布（后续安装见本节顶部）。Forge 已校验并生成 wechat-companion-0.3.6.cindy，scripts/verify-package.ps1 确认包内 9/9 文件 SHA256 与当前构建一致。
+
+宿主仍为 Cindy 0.1.128。运行构建 sourceCommit=742af4c3f3f477eac7dd796bfbac794390548253，公开源码定位限制沿用 .logs/feas/evidence.md；cancel/get 使用随包公开契约及已安装 asar 缓存中相同实现，不以本地 HEAD 替代运行构建。
+
 ## 0.3.5 主动发送微信（2026-11-07）
 
 用户从微信给喵喵发新消息后明确要求再次测试。list_bindings 确认喵喵已接收 1 条消息，出现已知联系人和 defaultPeerId，credentialStorage sealed、连接正常。通过同一个 local 实例 send_to_wechat 指定喵喵及该已知联系人，发送注明用途的主动通知测试文字，真实返回 ok:true、delivered:true、chunks:1、images:0；Bot 与联系人回执和所选目标一致，没有调用 reply_to_wechat。此项确认真实微信发送接口成功；未以接口回执推断用户已阅读、真实图片发送或完整重启后的端到端行为。

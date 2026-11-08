@@ -79,7 +79,7 @@ async function snapshot() {
   catch (err) { capabilityError = { code: err.code ?? 'TARGET_UNAVAILABLE', message: '伙伴列表不可用，仍可停用或删除已有绑定。' }; }
   const bindingGuides = [];
   for (const bot of config.bots) bindingGuides.push(await guides.refresh(bot));
-  return { plugin: { id: 'wechat-companion', name: '微信伙伴', version: '0.3.5' }, config, runtime, companions, bindingGuides, dispatchRetries: router.pendingRetries(), recoveryError, capabilityError, storageWarning: store.lastWarning };
+  return { plugin: { id: 'wechat-companion', name: '微信伙伴', version: '0.3.6' }, config, runtime, companions, bindingGuides, dispatchRetries: router.pendingRetries(), recoveryError, capabilityError, storageWarning: store.lastWarning };
 }
 async function command(action, args = {}, msg) {
   await init();

@@ -55,12 +55,19 @@
       this.lanes = /* @__PURE__ */ new Map();
       this.current = /* @__PURE__ */ new Map();
       this.generations = /* @__PURE__ */ new Map();
+      this.inboundTails = /* @__PURE__ */ new Map();
+      this.inboundEpochs = /* @__PURE__ */ new Map();
+      this.resetEpoch = 0;
       this.bindingSessions = /* @__PURE__ */ new Map();
       this.replyCalls = /* @__PURE__ */ new Map();
       this.sendCalls = /* @__PURE__ */ new Map();
     }
     setConfig(config2) {
       const next = new Map(config2.bots.map((bot) => [bot.id, bot]));
+      for (const [id, route] of this.routes) {
+        const replacement = next.get(id);
+        if (!replacement?.enabled || replacement.companionId !== route.companionId) this.invalidateInbound(id);
+      }
       for (const id of this.routes.keys()) if (!next.has(id)) {
         this.cancelBot(id);
         this.generations.delete(id);
@@ -75,6 +82,9 @@
       this.routes = next;
     }
     reset() {
+      this.resetEpoch++;
+      this.inboundTails.clear();
+      this.inboundEpochs.clear();
       for (const entry of this.requests.values()) {
         entry.state = "cancelled";
         entry.finish?.();
@@ -96,7 +106,12 @@
       this.replyCalls.set(callId, record);
       if (this.replyCalls.size > 512) this.replyCalls.delete(this.replyCalls.keys().next().value);
     }
-    cancelBot(botConfigId, generation) {
+    invalidateInbound(botId) {
+      this.inboundTails.delete(botId);
+      this.inboundEpochs.set(botId, (this.inboundEpochs.get(botId) ?? 0) + 1);
+    }
+    cancelBot(botConfigId, generation, detachInbound = true) {
+      if (detachInbound) this.invalidateInbound(botConfigId);
       for (const [id, entry] of this.requests) if (entry.botConfigId === botConfigId) {
         entry.state = "cancelled";
         entry.finish?.();
@@ -106,7 +121,95 @@
       this.current.delete(botConfigId);
       if (Number.isInteger(generation)) this.generations.set(botConfigId, Math.max(generation, this.generations.get(botConfigId) ?? 0));
     }
-    async receive(message) {
+    serializeInbound(botId, action) {
+      const epoch = this.resetEpoch, botEpoch = this.inboundEpochs.get(botId);
+      const pending = (this.inboundTails.get(botId) ?? Promise.resolve()).then(() => {
+        if (epoch !== this.resetEpoch || botEpoch !== this.inboundEpochs.get(botId)) return;
+        return action();
+      });
+      const tail = pending.catch(() => {
+      });
+      this.inboundTails.set(botId, tail);
+      void tail.then(() => {
+        if (this.inboundTails.get(botId) === tail) this.inboundTails.delete(botId);
+      });
+      return pending;
+    }
+    receive(message) {
+      return this.serializeInbound(message.botConfigId, () => this.receiveNow(message));
+    }
+    async replaceFailed(message) {
+      const blocker = this.requests.get(this.current.get(message.botConfigId));
+      const old = blocker?.state === "withdrawing" ? [...this.requests.values()].find((entry) => entry.botConfigId === message.botConfigId && entry.state === "queued") : blocker;
+      if (!old || !["retry_wait", "queued"].includes(old.state) || !message.peerId || old.peerId !== message.peerId || old.generation !== message.generation) return message;
+      const entries = [...this.requests.values()].filter((entry) => entry.botConfigId === message.botConfigId && (entry === old || entry.state === "queued"));
+      if (entries.some((entry) => entry.peerId !== message.peerId || entry.generation !== message.generation)) return message;
+      const signature = (part) => JSON.stringify([part.text, (part.attachments ?? []).map((image) => image.base64)]);
+      const incoming = { text: message.text, attachments: message.attachments };
+      const parts = signature(old) === signature(incoming) && entries.length === 1 ? [incoming] : [...entries.flatMap((entry) => entry.parts ?? [{ text: entry.text, attachments: entry.attachments }]).filter((part) => signature(part) !== signature(incoming)), incoming];
+      const text = parts.map((part) => part.text).join("\n\n");
+      const attachments = [...new Map(parts.flatMap((part) => part.attachments ?? []).map((image) => [image.base64, image])).values()];
+      if (text.length > 16e3 || attachments.length > 4) return message;
+      const oldState = old.state;
+      let withdrawal;
+      if (old.sendAttempted) {
+        if (typeof this.targets.get !== "function" || typeof this.targets.cancel !== "function") return message;
+        try {
+          const receipt = await this.targets.get({ requestKey: `wx-${old.requestId}` });
+          if (!(receipt?.found === false || receipt?.found === true && receipt.requestKey === `wx-${old.requestId}` && receipt.target?.kind === "bot" && receipt.target.id === old.companionId && receipt.status === "pending")) return message;
+          try {
+            withdrawal = await this.targets.cancel({ requestKey: `wx-${old.requestId}` });
+          } catch {
+          }
+          withdrawal ??= {};
+          if (withdrawal.cancelled !== true) withdrawal = {};
+        } catch {
+          return message;
+        }
+      }
+      if (old.state !== oldState || this.requests.get(old.requestId) !== old || this.routes.get(old.botConfigId)?.companionId !== old.companionId || !this.routes.get(old.botConfigId)?.enabled) return message;
+      if (old.retryTimer !== void 0) this.clearTimer(old.retryTimer);
+      old.retryTimer = void 0;
+      old.nextRetryAt = void 0;
+      for (const entry of entries) {
+        if (entry === old && withdrawal && withdrawal.settled !== true) {
+          entry.state = "withdrawing";
+          this.scheduleWithdrawal(entry);
+          continue;
+        }
+        entry.state = "superseded";
+        entry.finish();
+        void this.rejectInbound(entry.requestId, "REQUEST_SUPERSEDED").catch(() => {
+        });
+      }
+      if (old.state === "withdrawing") this.lanes.set(old.botConfigId, old.done);
+      else if (blocker?.state === "withdrawing") this.lanes.set(blocker.botConfigId, blocker.done);
+      return { ...message, text, ...attachments.length ? { attachments } : {}, parts };
+    }
+    scheduleWithdrawal(entry) {
+      if (entry.state !== "withdrawing" || this.requests.get(entry.requestId) !== entry) return;
+      entry.receiptTimer = this.setTimer(async () => {
+        entry.receiptTimer = void 0;
+        try {
+          const receipt = await this.targets.get({ requestKey: `wx-${entry.requestId}` });
+          if (entry.state !== "withdrawing" || this.requests.get(entry.requestId) !== entry) return;
+          if (receipt?.found === true && receipt.requestKey === `wx-${entry.requestId}` && receipt.target?.kind === "bot" && receipt.target.id === entry.companionId && receipt.status === "cancelled" && receipt.settled === true) {
+            entry.state = "superseded";
+            entry.finish();
+            try {
+              await this.rejectInbound(entry.requestId, "REQUEST_SUPERSEDED");
+            } catch {
+            }
+            return;
+          }
+        } catch (error) {
+          if (["PERMISSION_DENIED", "UNSUPPORTED_CAPABILITY", "INVALID_PARAMS"].includes(error.code)) return;
+        }
+        this.scheduleWithdrawal(entry);
+      }, [1e3, 5e3, 15e3][Math.min(entry.withdrawalPoll = (entry.withdrawalPoll ?? -1) + 1, 2)]);
+      entry.receiptTimer?.unref?.();
+    }
+    async receiveNow(message) {
       const bot = this.routes.get(message.botConfigId);
       if (!bot?.enabled || typeof message.requestId !== "string" || typeof message.text !== "string" || !message.text.trim() || message.text.length > 16e3) {
         await this.rejectInbound(message.requestId, "INVALID_INPUT");
@@ -118,14 +221,21 @@
         await this.rejectInbound(message.requestId, "STALE_CONNECTION");
         return;
       }
-      if (message.generation > generation) this.cancelBot(message.botConfigId, message.generation);
-      for (const [id, old] of this.requests) if (this.now() - old.createdAt > 30 * 6e4 && !(old.state === "accepted" && old.replyKey !== void 0)) {
+      if (message.generation > generation) this.cancelBot(message.botConfigId, message.generation, false);
+      for (const [id, old] of this.requests) if (this.now() - old.createdAt > 30 * 6e4 && old.state !== "withdrawing" && !(old.state === "accepted" && old.replyKey !== void 0)) {
         old.state = "expired";
         old.finish?.();
         this.requests.delete(id);
       }
       if (this.requests.size >= 256) {
         await this.rejectInbound(message.requestId, "INBOX_FULL");
+        return;
+      }
+      const receiveEpoch = this.resetEpoch, botEpoch = this.inboundEpochs.get(message.botConfigId);
+      message = await this.replaceFailed(message);
+      const currentRoute = this.routes.get(message.botConfigId);
+      if (receiveEpoch !== this.resetEpoch || botEpoch !== this.inboundEpochs.get(message.botConfigId) || !currentRoute?.enabled || currentRoute.companionId !== bot.companionId || this.generations.get(message.botConfigId) !== message.generation) {
+        await this.rejectInbound(message.requestId, "BINDING_CHANGED");
         return;
       }
       const entry = { ...message, companionId: bot.companionId, createdAt: this.now(), state: "queued" };
@@ -140,6 +250,7 @@
           entry.receiptTimer = void 0;
           entry.monitorReceipt = false;
           entry.attachments = void 0;
+          entry.parts = void 0;
           if (this.current.get(entry.botConfigId) === entry.requestId) this.current.delete(entry.botConfigId);
           if (this.lanes.get(entry.botConfigId) === entry.done) this.lanes.delete(entry.botConfigId);
           resolve();
@@ -148,7 +259,7 @@
       this.lanes.set(entry.botConfigId, entry.done);
       const start = entry.start = async () => {
         const route = this.routes.get(entry.botConfigId);
-        if (entry.state === "cancelled" || !route?.enabled || route.companionId !== entry.companionId) fail("BINDING_CHANGED", "\u7ED1\u5B9A\u5DF2\u6539\u53D8\uFF0C\u4E0D\u80FD\u6D3E\u53D1\u65E7\u6D88\u606F\u3002");
+        if (!["queued", "retry_wait"].includes(entry.state) || !route?.enabled || route.companionId !== entry.companionId) fail("BINDING_CHANGED", "\u7ED1\u5B9A\u5DF2\u6539\u53D8\uFF0C\u4E0D\u80FD\u6D3E\u53D1\u65E7\u6D88\u606F\u3002");
         if (this.now() - entry.createdAt > 30 * 6e4) fail("REQUEST_EXPIRED", "\u5FAE\u4FE1\u8BF7\u6C42\u5DF2\u8FC7\u671F\u3002");
         this.current.set(entry.botConfigId, entry.requestId);
         entry.state = "dispatching";
@@ -161,14 +272,15 @@
       });
     }
     pendingRetries() {
-      return [...this.requests.values()].filter((entry) => entry.state === "retry_wait").map((entry) => ({
+      return [...this.requests.values()].filter((entry) => ["retry_wait", "withdrawing"].includes(entry.state)).map((entry) => ({
         botConfigId: entry.botConfigId,
         attempt: entry.dispatchRetries,
-        retryAt: entry.nextRetryAt
+        retryAt: entry.nextRetryAt,
+        ...entry.state === "withdrawing" ? { withdrawing: true } : {}
       }));
     }
     async dispatchFailed(entry, error) {
-      if (entry.state === "cancelled" || this.requests.get(entry.requestId) !== entry) return;
+      if (["cancelled", "superseded", "withdrawing"].includes(entry.state) || this.requests.get(entry.requestId) !== entry) return;
       const route = this.routes.get(entry.botConfigId);
       if (!route?.enabled || route.companionId !== entry.companionId) error = { code: "BINDING_CHANGED" };
       const retry = entry.dispatchRetries ?? 0, delay = DISPATCH_RETRY_DELAYS[retry];
@@ -177,12 +289,13 @@
           entry.state = "retry_wait";
           entry.dispatchRetries = retry + 1;
           entry.nextRetryAt = this.now() + delay;
-          entry.retryTimer = this.setTimer(() => {
+          entry.retryTimer = this.setTimer(() => this.serializeInbound(entry.botConfigId, () => {
+            if (entry.state !== "retry_wait" || this.requests.get(entry.requestId) !== entry) return;
             entry.retryTimer = void 0;
             entry.nextRetryAt = void 0;
             entry.accepted = entry.start();
             return entry.accepted.catch((nextError) => this.dispatchFailed(entry, nextError));
-          }, delay);
+          }), delay);
           entry.retryTimer?.unref?.();
           return;
         }
@@ -211,6 +324,7 @@
       const requestKey = `wx-${entry.requestId}`;
       const route = this.routes.get(entry.botConfigId);
       if (entry.state !== "dispatching" || !route?.enabled || route.companionId !== entry.companionId) fail("BINDING_CHANGED", "\u7ED1\u5B9A\u5DF2\u6539\u53D8\uFF0C\u4E0D\u80FD\u6D3E\u53D1\u65E7\u6D88\u606F\u3002");
+      entry.sendAttempted = true;
       const receipt = await this.targets.send({
         target,
         requestKey,
@@ -225,6 +339,7 @@
       entry.state = "accepted";
       this.bindSession(entry.botConfigId, entry.companionId, receipt.taskId);
       entry.attachments = void 0;
+      entry.parts = void 0;
       entry.requestKey = requestKey;
       entry.executionId = receipt.executionId;
       if (caps.delegation.receiptQuery === true && caps.delegation.settled === true && typeof this.targets.get === "function") {
@@ -319,6 +434,7 @@
       } else if (typeof requestId !== "string" || !requestId) fail("INVALID_REPLY", "request_id \u987B\u7701\u7565\u6216\u4F7F\u7528\u539F\u8BF7\u6C42\u7F16\u53F7\u3002");
       const entry = this.requests.get(requestId);
       if (!entry || this.now() - entry.createdAt > 30 * 6e4) fail("REQUEST_EXPIRED", "\u8BF7\u6C42\u4E0D\u5B58\u5728\u6216\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u8BA9\u5FAE\u4FE1\u7528\u6237\u91CD\u65B0\u53D1\u9001\u3002");
+      if (["superseded", "withdrawing"].includes(entry.state)) fail("REQUEST_SUPERSEDED", "\u8FD9\u6761\u8BF7\u6C42\u5DF2\u7531\u7528\u6237\u7684\u65B0\u6D88\u606F\u66FF\u6362\u6216\u5408\u5E76\uFF0C\u4E0D\u80FD\u56DE\u4F20\u65E7\u56DE\u590D\u3002");
       if (entry.state === "settled") fail("REQUEST_SETTLED", "\u4F19\u4F34\u5DF2\u7ED3\u675F\u672C\u6B21\u8BF7\u6C42\u4F46\u672A\u56DE\u4F20\uFF0C\u4E0D\u80FD\u8865\u53D1\u65E7\u56DE\u590D\uFF0C\u8BF7\u8BA9\u5FAE\u4FE1\u7528\u6237\u91CD\u65B0\u53D1\u9001\u3002");
       const bot = this.routes.get(entry.botConfigId);
       if (!bot?.enabled || bot.companionId !== entry.companionId) fail("BINDING_CHANGED", "\u539F\u7ED1\u5B9A\u5DF2\u7ECF\u505C\u7528\u6216\u6539\u53D8\uFF0C\u4E0D\u80FD\u56DE\u4F20\u65E7\u56DE\u590D\u3002");
@@ -927,7 +1043,7 @@
     }
     const bindingGuides = [];
     for (const bot of config.bots) bindingGuides.push(await guides.refresh(bot));
-    return { plugin: { id: "wechat-companion", name: "\u5FAE\u4FE1\u4F19\u4F34", version: "0.3.5" }, config, runtime, companions, bindingGuides, dispatchRetries: router.pendingRetries(), recoveryError, capabilityError, storageWarning: store.lastWarning };
+    return { plugin: { id: "wechat-companion", name: "\u5FAE\u4FE1\u4F19\u4F34", version: "0.3.6" }, config, runtime, companions, bindingGuides, dispatchRetries: router.pendingRetries(), recoveryError, capabilityError, storageWarning: store.lastWarning };
   }
   async function command(action, args = {}, msg) {
     await init();

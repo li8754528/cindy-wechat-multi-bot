@@ -226,7 +226,7 @@ class BotManager {
       if (emit) void this.sendVoiceNotice(event, state.abort?.signal);
       return event;
     }
-    const event = { requestId, botConfigId: state.config.id, generation, instanceId: this.instanceId, text: message.text.trim() ? message.text : '请查看微信用户发送的图片。' };
+    const event = { requestId, botConfigId: state.config.id, generation, instanceId: this.instanceId, peerId: message.peerId, text: message.text.trim() ? message.text : '请查看微信用户发送的图片。' };
     if (emit && !message.images.length) this.notify('wechat/inbound', event);
     else if (emit) void this.prepareInbound(event, state.abort?.signal).then(prepared => this.notifyInbound(prepared), err => this.reject(requestId, err.code ?? 'IMAGE_DOWNLOAD_FAILED'));
     return event;
@@ -303,6 +303,7 @@ class BotManager {
     if (entry.state === 'rejected') return { rejected: false };
     this.releaseImages(entry);
     this.clearStaged(entry);
+    if (code === 'REQUEST_SUPERSEDED') { entry.state = 'superseded'; return { superseded: true }; }
     entry.state = 'rejected'; const state = this.bots.get(entry.botConfigId);
     if (state) { state.stats.rejected++; state.lastErrorCode = /^[A-Z_]+$/.test(code ?? '') ? code : 'DISPATCH_FAILED'; }
     return { rejected: true };

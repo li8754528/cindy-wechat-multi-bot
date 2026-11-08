@@ -5,8 +5,8 @@
   "name": "微信伙伴",
   "description": "一个插件管理多个微信 Bot，每个固定绑定一个 Cindy 伙伴。支持文字与图片收发、按主人要求主动发送通知；收到语音提示先转成文字。登录与联系人上下文安全保存，重启自动恢复。",
   "whenToUse": "配置微信 Bot 与伙伴绑定、扫码登录、查看连接状态、回传当前微信消息答案，或按主人要求主动向已联系的微信用户发送文字与图片时使用。",
-  "version": "0.3.5",
-  "releaseNotes": "新增 send_to_wechat 主动发送工具，无需当前微信请求，支持文字和图片。伙伴默认使用自己的绑定，桌面任务可指定 Bot；默认发给该 Bot 最近联系的微信用户，也可选择已有联系人。联系人发送上下文随登录加密保存，重启后恢复；换绑伙伴、退出登录或更换微信账号清除上下文。回传工具仍只处理当前请求，无当前请求时提示使用主动发送工具。修复工作进程恢复时丢失伙伴会话映射的问题。保持原有权限与登录格式兼容，未知发送不自动重试。",
+  "version": "0.3.6",
+  "releaseNotes": "优化微信转交失败后的新消息处理：同一 Bot、同一联系人的重复内容替换旧重试，不同内容按顺序合并，保留图片并使用最新消息上下文回传。结果不确定的旧投递先查询并撤回，确认结束后才派发新请求；已受理输入不合并。合并超过文字或图片上限时保留原消息顺序，不截断。旧请求与迟到重试失效，面板显示等待撤回状态。权限与登录数据兼容。",
   "entry": "main.js",
   "command": "微信伙伴",
   "showTaskPreferences": false,
@@ -68,10 +68,7 @@
       "parameters": {
         "type": "object",
         "properties": {
-          "id": {
-            "type": "string",
-            "description": "1–48 位字母、数字、下划线或连字符配置标识"
-          },
+          "id": { "type": "string", "description": "1–48 位字母、数字、下划线或连字符配置标识" },
           "name": {
             "type": "string",
             "description": "这组 Bot 显示名称"
@@ -99,10 +96,7 @@
       "parameters": {
         "type": "object",
         "properties": {
-          "id": {
-            "type": "string",
-            "description": "Bot 配置标识"
-          }
+          "id": { "type": "string", "description": "Bot 配置标识" }
         },
         "required": [
           "id"
@@ -116,10 +110,7 @@
       "parameters": {
         "type": "object",
         "properties": {
-          "id": {
-            "type": "string",
-            "description": "Bot 配置标识"
-          }
+          "id": { "type": "string", "description": "Bot 配置标识" }
         },
         "required": [
           "id"
@@ -133,10 +124,7 @@
       "parameters": {
         "type": "object",
         "properties": {
-          "id": {
-            "type": "string",
-            "description": "Bot 配置标识"
-          }
+          "id": { "type": "string", "description": "Bot 配置标识" }
         },
         "required": [
           "id"
@@ -150,10 +138,7 @@
       "parameters": {
         "type": "object",
         "properties": {
-          "id": {
-            "type": "string",
-            "description": "Bot 配置标识"
-          }
+          "id": { "type": "string", "description": "Bot 配置标识" }
         },
         "required": [
           "id"
@@ -171,10 +156,7 @@
             "type": "string",
             "description": "可选：旧版桥接请求编号；省略时只查当前宿主伙伴会话对应的唯一有效请求"
           },
-          "text": {
-            "type": "string",
-            "description": "仅针对此次微信消息的回复，最多 8000 字符；仅发送图片时可省略"
-          }
+          "text": { "type": "string", "description": "仅针对此次微信消息的回复，最多 8000 字符；仅发送图片时可省略" }
         },
         "additionalProperties": false
       }
@@ -198,10 +180,7 @@
       "parameters": {
         "type": "object",
         "properties": {
-          "id": {
-            "type": "string",
-            "description": "Bot 配置标识"
-          }
+          "id": { "type": "string", "description": "Bot 配置标识" }
         },
         "required": [
           "id"

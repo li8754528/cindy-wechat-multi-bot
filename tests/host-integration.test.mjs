@@ -10,6 +10,7 @@ const code = () => readFileSync('wechat-companion/main.js', 'utf8');
 function makeHost(shared) {
   if (!shared.legacyGuides && !shared.config.bindingGuides) shared.config.bindingGuides = shared.config.bots.filter(bot => bot.companionId).map(bot =>
     ({ botId: bot.id, companionId: bot.companionId, key: `wx-guide-fixture-${bot.id}`, state: 'ready', sessionId: 'session-a' }));
+  const cancelledKeys = new Set(), failedKeys = new Set();
   const handlers = [], results = [], dispatches = [], guideDispatches = [], deliveries = [], notifications = [], timers = [], receiptQueries = [], channels = []; let qrCalls = 0, sequence = 0;
   const manager = new BotManager({ clientFactory: opts => ({
     begin: async () => { qrCalls++; return { qrcode: `test-${sequence++}`, qrcode_img_content: 'https://ilinkai.weixin.qq.com/scan' }; },
@@ -41,12 +42,16 @@ function makeHost(shared) {
     targets: { capabilities: async () => ({ delegation: { execution: true, receiptQuery: shared.receiptQuery ?? true, settled: shared.receiptQuery ?? true } }),
       resolve: async ({ target }) => target, list: async () => ({ targets: [{ id: 'buddy-a', label: 'A' }] }),
       send: async req => { (req.requestKey.startsWith('wx-guide-') ? guideDispatches : dispatches).push(req);
-        if (!req.requestKey.startsWith('wx-guide-') && shared.failDispatchCount > 0) { shared.failDispatchCount--; throw Object.assign(new Error('host not ready'), { code: 'HOST_NOT_READY' }); }
+        if (!req.requestKey.startsWith('wx-guide-') && shared.failDispatchCount > 0) { shared.failDispatchCount--; failedKeys.add(req.requestKey); throw Object.assign(new Error('host not ready'), { code: 'HOST_NOT_READY' }); }
         return { accepted: true, taskId: 'session-a', executionId: `execution-${req.requestKey}` }; },
+      cancel: async ({ requestKey }) => { cancelledKeys.add(requestKey); return { cancelled: true, settled: true }; },
       get: async ({ requestKey }) => { if (requestKey.startsWith('wx-guide-')) return { found: true, requestKey, taskId: 'session-a',
         target: { kind: 'bot', id: guideDispatches.find(req => req.requestKey === requestKey)?.target.id ?? 'buddy-a' },
         settled: shared.guideSettled !== false, result: { outcome: shared.guideOutcome ?? 'completed' } };
-        receiptQueries.push(requestKey); return { found: true, requestKey, taskId: 'session-a', executionId: `execution-${requestKey}`,
+        receiptQueries.push(requestKey);
+        if (shared.pendingFailedReceipts && failedKeys.has(requestKey)) return { found: true, requestKey, taskId: 'session-a',
+          target: { kind: 'bot', id: 'buddy-a' }, status: cancelledKeys.has(requestKey) ? 'cancelled' : 'pending', settled: cancelledKeys.has(requestKey) };
+        return { found: true, requestKey, taskId: 'session-a', executionId: `execution-${requestKey}`,
         target: { kind: 'bot', id: 'buddy-a' }, status: 'accepted', settled: shared.settled === true,
         result: Object.hasOwn(shared, 'terminalResult') ? shared.terminalResult : { outcome: 'completed', outputMessageId: 'desktop-output' } }; } },
     fs: async req => {
@@ -424,4 +429,25 @@ test('existing bindings get an explicit one-time guide; guide confirmation canno
   const answer = await restarted.tool('reply_to_wechat', { text: '仅本次回答', session_context: { session_id: 'session-a' } });
   assert.equal(answer.ok, true); assert.equal(restarted.deliveries[0].peerId, 'wechat-peer');
   assert.equal(restarted.deliveries.length, 1); restarted.manager.close();
+});
+
+
+test('packaged main merges failed same-contact messages and replies once using newest WeChat context', async t => {
+  const shared = { config: { bots: [binding] }, key: null, file: null, failDispatchCount: 1, pendingFailedReceipts: true };
+  const host = makeHost(shared); t.after(() => host.manager.close());
+  await host.tool('list_bindings'); await host.tool('begin_login', { id: 'a' }); await host.tool('check_login', { id: 'a' });
+  await host.tool('upsert_binding', { id: 'a', name: 'A', companion_id: 'buddy-a', enabled: true });
+  const state = host.manager.bot('a');
+  const ingest = (id, text, token) => host.manager.ingest(state, state.generation, { message_id: id, message_type: 1,
+    from_user_id: 'wechat-peer', context_token: token, item_list: [{ type: 1, text_item: { text } }] });
+  ingest(801, '前一条', 'old-context'); await host.drainEvents();
+  assert.equal(host.dispatches.length, 1);
+  ingest(802, '补充内容', 'latest-context'); await host.drainEvents();
+  assert.equal(host.dispatches.length, 2); assert.equal(host.dispatches[1].text, '前一条\n\n补充内容');
+  assert.equal(host.manager.requests.get(host.dispatches[0].requestKey.slice(3)).state, 'superseded');
+  assert.equal(host.manager.status().bots[0].stats.rejected, 0);
+  const reply = await host.tool('reply_to_wechat', { text: '合并后的回答', session_context: { session_id: 'session-a' } });
+  assert.equal(reply.ok, true); assert.equal(host.deliveries.length, 1);
+  assert.equal(host.deliveries[0].contextToken, 'latest-context'); assert.equal(host.deliveries[0].peerId, 'wechat-peer');
+  const snapshot = await host.tool('list_bindings'); assert.equal(snapshot.result.dispatchRetries.length, 0);
 });

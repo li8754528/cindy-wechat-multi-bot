@@ -5,12 +5,12 @@ import { ReplyRouter, validateConfig } from '../src/core.mjs';
 const inbound = (requestId, botConfigId = 'a', text = '你好') => ({ requestId, botConfigId, text, generation: 1 });
 const defer = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
 function fixture({ messageContext = true, messageCaps, caps = { execution: true, receiptQuery: true, settled: true },
-  get, send, beforeDispatch, nodeReply, readImages, noGet = false } = {}) {
+  get, send, cancel, beforeDispatch, nodeReply, readImages, noGet = false } = {}) {
   const sends = [], replies = [], rejected = [], queries = [], timers = [], delays = []; let time = 0;
   const receipt = (requestId, extra = {}) => ({ found: true, requestKey: `wx-${requestId}`, executionId: `execution-${requestId}`,
     target: { kind: 'bot', id: requestId.startsWith('b') ? 'buddy-b' : 'buddy-a' },
     taskId: requestId.startsWith('b') ? 'session-buddy-b' : 'session-buddy-a', status: 'accepted', settled: true, ...extra });
-  const targets = { capabilities: async () => ({ delegation: caps }), resolve: async ({ target }) => target,
+  const targets = { ...(cancel ? { cancel } : {}), capabilities: async () => ({ delegation: caps }), resolve: async ({ target }) => target,
     send: async request => { sends.push(request); return send ? send(request) : { accepted: true, taskId: `session-${request.target.id}`, executionId: `execution-${request.requestKey.slice(3)}` }; },
     ...(!noGet ? { get: async request => { queries.push(request); return get ? get(request) : receipt(request.requestKey.slice(3), { settled: false }); } } : {}) };
   const router = new ReplyRouter({ targets, tasks: { capabilities: messageCaps ?? (async () => ({ messageContext, messageAttachments: { kinds: ['image'] } })) },
@@ -264,4 +264,136 @@ test('implicit reply cannot revive a settled or expired request, while explicit 
   await f.router.receive(inbound('a2')); f.setTime(30 * 60000 + 1);
   await assert.rejects(f.router.reply(undefined, 'expired', 'session-buddy-a'), { code: 'REQUEST_EXPIRED' });
   assert.equal(f.replies.length, 0);
+});
+
+
+const peerInput = (id, text = '你好', extra = {}) => ({ ...inbound(id, 'a', text), peerId: 'peer-a', ...extra });
+const pendingReceipt = requestKey => ({ found: true, requestKey, target: { kind: 'bot', id: 'buddy-a' }, status: 'pending', taskId: 'session-buddy-a' });
+
+test('same-user duplicate replaces failed request immediately, cancels exact key and fences late retry/reply', async () => {
+  const cancelled = [];
+  const f = fixture({ get: async ({ requestKey }) => pendingReceipt(requestKey),
+    cancel: async request => { cancelled.push(request); return { cancelled: true, settled: true }; },
+    send: async request => { if (request.requestKey === 'wx-a1') throw new Error('route busy'); return { accepted: true, taskId: 'session-buddy-a' }; } });
+  await f.router.receive(peerInput('a1')); const timer = f.timers[0];
+  await f.router.receive(peerInput('a2'));
+  assert.deepEqual(cancelled, [{ requestKey: 'wx-a1' }]);
+  assert.deepEqual(f.sends.map(req => [req.requestKey, req.text]), [['wx-a1', '你好'], ['wx-a2', '你好']]);
+  assert.equal(f.router.requests.get('a1').state, 'superseded');
+  assert.deepEqual(f.rejected, [['a1', 'REQUEST_SUPERSEDED']]);
+  await timer.callback(); assert.equal(f.sends.length, 2);
+  await assert.rejects(f.router.reply('a1', 'old', 'session-buddy-a'), { code: 'REQUEST_SUPERSEDED' });
+  await f.router.reply(undefined, 'new answer', 'session-buddy-a');
+  assert.deepEqual(f.replies.map(req => req.requestId), ['a2']); f.router.reset();
+});
+
+test('different failed input accumulates in order, dedupes repeated parts and retains all distinct images', async () => {
+  let ready = false;
+  const f = fixture({ beforeDispatch: async () => { if (!ready) throw new Error('guide pending'); } });
+  const image = base64 => ({ name: 'image.png', base64 });
+  await f.router.receive(peerInput('a1', '第一条', { attachments: [image('AAAA')] }));
+  await f.router.receive(peerInput('a2', '第二条', { attachments: [image('BBBB')] }));
+  assert.equal(f.router.requests.get('a2').text, '第一条\n\n第二条');
+  ready = true;
+  await f.router.receive(peerInput('a3', '第二条', { attachments: [image('BBBB')] }));
+  assert.equal(f.sends.length, 1); assert.equal(f.sends[0].text, '第一条\n\n第二条');
+  assert.deepEqual(f.sends[0].attachments.map(item => item.base64), ['AAAA', 'BBBB']);
+  assert.equal(f.sends[0].requestKey, 'wx-a3'); assert.equal(f.router.requests.get('a1').parts, undefined);
+  f.router.reset();
+});
+
+test('same text with different images merges; already accepted delivery and different contacts never merge', async () => {
+  for (const mode of ['images', 'other-peer', 'accepted', 'missing-cancel', 'query-error', 'too-long', 'too-many-images']) {
+    let fail = true;
+    const f = fixture({
+      get: async ({ requestKey }) => { if (mode === 'query-error') throw new Error('timeout'); return mode === 'accepted' ? { ...pendingReceipt(requestKey), status: 'accepted' } : pendingReceipt(requestKey); },
+      ...(mode === 'missing-cancel' ? {} : { cancel: async () => ({ cancelled: true, settled: true }) }),
+      send: async () => { if (fail) throw new Error('busy'); return { accepted: true, taskId: 'session-buddy-a' }; } });
+    const old = peerInput('a1', mode === 'too-long' ? 'A'.repeat(9000) : '内容', { attachments: [{ base64: 'AAAA' }] });
+    if (mode === 'too-many-images') old.attachments = ['A','B','C','D'].map(base64 => ({ base64 }));
+    await f.router.receive(old); fail = false;
+    await f.router.receive(peerInput('a2', mode === 'too-long' ? 'B'.repeat(9000) : '内容', {
+      peerId: mode === 'other-peer' ? 'peer-b' : 'peer-a', attachments: [{ base64: 'BBBB' }] }));
+    if (mode === 'images') {
+      assert.equal(f.sends.length, 2); assert.equal(f.sends[1].text, '内容\n\n内容');
+      assert.equal(f.sends[1].attachments.length, 2);
+    } else { assert.equal(f.sends.length, 1, mode); assert.equal(f.router.requests.get('a2').state, 'queued', mode); }
+    f.router.reset();
+  }
+});
+
+test('unsettled withdrawal holds merged input and later arrivals until reliable cancellation settles', async () => {
+  let settled = false; const cancelled = [];
+  const f = fixture({ get: async ({ requestKey }) => ({ ...pendingReceipt(requestKey), status: cancelled.length ? 'cancelled' : 'pending', settled }),
+    cancel: async request => { cancelled.push(request); return { cancelled: true }; },
+    send: async request => { if (request.requestKey === 'wx-a1') throw new Error('busy'); return { accepted: true, taskId: 'session-buddy-a' }; } });
+  await f.router.receive(peerInput('a1', 'A'));
+  await f.router.receive(peerInput('a2', 'B'));
+  assert.equal(f.router.requests.get('a1').state, 'withdrawing'); assert.equal(f.sends.length, 1);
+  await f.router.receive(peerInput('a3', 'C'));
+  assert.equal(f.router.requests.get('a2').state, 'superseded'); assert.equal(f.sends.length, 1);
+  await f.tick(); assert.equal(f.sends.length, 1);
+  settled = true; await f.tick(); await f.router.requests.get('a3').accepted;
+  assert.equal(cancelled.length, 1); assert.equal(f.sends.length, 2);
+  assert.equal(f.sends[1].text, 'A\n\nB\n\nC'); f.router.reset();
+});
+
+test('new arrivals during initial send serialize, merge after failure and do not dispatch the stale timer', async () => {
+  const gate = defer(); const f = fixture({ get: async ({ requestKey }) => pendingReceipt(requestKey),
+    cancel: async () => ({ cancelled: true, settled: true }), send: async req => {
+      if (req.requestKey === 'wx-a1') return gate.promise;
+      throw new Error('still offline');
+    } });
+  const first = f.router.receive(peerInput('a1', 'A'));
+  const second = f.router.receive(peerInput('a2', 'B'));
+  const third = f.router.receive(peerInput('a3', 'C'));
+  gate.reject(new Error('busy')); await Promise.all([first, second, third]);
+  assert.deepEqual(f.sends.map(req => req.text), ['A', 'A\n\nB', 'A\n\nB\n\nC']);
+  assert.equal(f.router.pendingRetries().length, 1); f.router.reset();
+});
+
+test('reset or rebind during cancellation never dispatches a replacement or revives the old request', async () => {
+  for (const reset of [true, false]) {
+    const gate = defer(); let cancelStarted; const started = new Promise(resolve => { cancelStarted = resolve; });
+    const f = fixture({ get: async ({ requestKey }) => pendingReceipt(requestKey),
+      cancel: async () => { cancelStarted(); return gate.promise; }, send: async () => { throw new Error('busy'); } });
+    await f.router.receive(peerInput('a1'));
+    const replacing = f.router.receive(peerInput('a2', '新内容')); await started;
+    if (reset) f.router.reset(); else f.router.setConfig(validateConfig({ bots: [{ id: 'a', name: 'A', enabled: true, companionId: 'other-buddy' }] }));
+    gate.resolve({ cancelled: true, settled: true }); await replacing;
+    assert.equal(f.sends.length, 1); assert.equal(f.timers.length, 0); assert.equal(f.router.current.size, 0); f.router.reset();
+  }
+});
+
+
+test('lost cancellation ACK stays fenced until cancelled receipt settles; reset invalidates late query', async () => {
+  let queried = false; const gate = defer();
+  const f = fixture({ get: async ({ requestKey }) => { if (queried) return gate.promise; queried = true; return pendingReceipt(requestKey); },
+    cancel: async () => { throw new Error('ACK lost'); }, send: async () => { throw new Error('busy'); } });
+  await f.router.receive(peerInput('a1', 'A')); await f.router.receive(peerInput('a2', 'B'));
+  assert.equal(f.router.requests.get('a1').state, 'withdrawing'); assert.equal(f.sends.length, 1);
+  const polling = f.tick(); f.router.reset();
+  gate.resolve({ ...pendingReceipt('wx-a1'), status: 'cancelled', settled: true }); await polling;
+  assert.equal(f.sends.length, 1); assert.equal(f.timers.length, 0); assert.equal(f.router.current.size, 0);
+});
+
+
+test('connection reset, router reset and rebind detach hung cancellation from new inbound work', async () => {
+  for (const action of ['connection', 'reset', 'rebind']) {
+    const gate = defer(), begun = defer(); let offline = true;
+    const f = fixture({ get: async ({ requestKey }) => pendingReceipt(requestKey),
+      cancel: async () => { begun.resolve(); return gate.promise; },
+      send: async request => { if (offline) throw new Error('busy'); return { accepted: true, taskId: `session-${request.target.id}` }; } });
+    await f.router.receive(peerInput('a1'));
+    const blocked = f.router.receive(peerInput('a2', 'stale')); await begun.promise;
+    const queued = f.router.receive(peerInput('a3', 'also stale'));
+    if (action === 'connection') f.router.cancelBot('a', 2);
+    else if (action === 'reset') f.router.reset();
+    else f.router.setConfig(validateConfig({ bots: [{ id: 'a', name: 'A', enabled: true, companionId: 'new-buddy' }] }));
+    offline = false;
+    await f.router.receive(peerInput('a4', 'fresh', { generation: action === 'connection' ? 2 : 1 }));
+    assert.equal(f.sends.at(-1).text, 'fresh'); assert.equal(f.router.current.get('a'), 'a4');
+    gate.resolve({ cancelled: true, settled: true }); await Promise.all([blocked, queued]);
+    assert.equal(f.sends.length, 2); assert.equal(f.router.current.get('a'), 'a4'); f.router.reset();
+  }
 });
