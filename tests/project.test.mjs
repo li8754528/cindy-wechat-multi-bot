@@ -48,7 +48,7 @@ test('project inputs retain pure text, separate Bot memories and original task r
   for (const id of ['a','b']) await router.receive({requestId:id,botConfigId:id,peerId:'peer',text:'你好',generation:1});
   assert.equal(sent[0].text, '你好'); assert.deepEqual(sent[0].target,{kind:'project',id:'C:/project'});
   assert.deepEqual(sent[0].route,route); assert.equal(sent[0].delegation,undefined);
-  assert.equal(JSON.parse(sent[0].context).memory,'memory-a'); assert.equal(JSON.parse(sent[1].context).memory,'memory-b');
+  assert.equal(sent[0].context,undefined); assert.equal(sent[1].context,undefined);
   assert.deepEqual(sessions,['task-1','task-2']);
   await assert.rejects(router.reply('a','wrong','task-2'),{code:'WRONG_COMPANION'});
   await router.reply('a','answer','task-1'); assert.equal(replies[0].requestId,'a'); router.reset();

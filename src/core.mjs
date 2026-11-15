@@ -1,4 +1,4 @@
-import { projectSettings, projectContext, executionReady, botExecution, botProjectMode } from './project-settings.mjs';
+import { projectSettings, executionReady, botExecution, botProjectMode } from './project-settings.mjs';
 export function fail(code, message) {
   throw Object.assign(new Error(message), { code });
 }
@@ -285,10 +285,9 @@ export class ReplyRouter {
     if (entry.attachments?.length && !(await this.tasks?.capabilities?.({}))?.messageAttachments?.kinds?.includes('image'))
       fail('UNSUPPORTED_CAPABILITY', '当前 Cindy 不支持项目任务接收图片。');
     if (entry.state !== 'dispatching') fail('BINDING_CHANGED', '请求已失效。');
-    entry.projectContext ??= projectContext(entry, entry.memory ?? '');
     entry.sendAttempted = true;
     const receipt = await this.targets.send({ target, requestKey: `wx-${entry.requestId}`, text: entry.text,
-      context: entry.projectContext, ...(target.kind === 'project' ? { route: entry.execution.route, ...(entry.execution.permissionMode ? { permissionMode: entry.execution.permissionMode } : {}) } : {}), title: '微信 · ' + entry.botConfigId,
+      ...(target.kind === 'project' ? { route: entry.execution.route, ...(entry.execution.permissionMode ? { permissionMode: entry.execution.permissionMode } : {}) } : {}), title: '微信 · ' + entry.botConfigId,
       delivery: 'queue', ...(entry.attachments?.length ? { attachments: entry.attachments } : {}) });
     if (receipt?.accepted !== true || !receipt.taskId) fail('DELIVERY_UNCERTAIN', '项目任务未返回明确受理回执，请在 Cindy 检查。');
     this.projectConversations.set(key, { id: receipt.taskId, at: this.now() });

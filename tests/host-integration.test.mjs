@@ -30,7 +30,7 @@ test('completing project settings with an unpaired Bot preserves another Bot in-
   host.manager.notifyInbound(await host.manager.prepareInbound(event));await host.drainEvents();
   const saved=await host.ui('save_execution',{project:'C:/project',route:{agentKind:'codex',providerId:'local',model:'test',effort:'high',fastMode:false}});
   assert.equal(saved.ok,true);assert.equal(shared.config.bots[1].companionId,'project-b');
-  const reply=await host.tool('reply_to_wechat',{request_id:event.requestId,text:'answer',session_context:{session_id:'session-a'}});
+  const reply=await host.tool('reply_to_wechat',{text:'answer',session_context:{session_id:'session-a'}});
   assert.equal(reply.ok,true);assert.equal(host.deliveries.length,1);
 });
 test('a corrupt Bot memory can be manually cleared without blocking other settings', async t => {
@@ -77,14 +77,14 @@ test('project mode persists Bot memory, restores it on restart and rejects forei
   const event=await receive(host,900);
   assert.equal((await host.ui('save_bot_route',{id:'a',mode:'companion'})).code,'ROUTE_BUSY');
   assert.equal(host.dispatches[0].target.kind,'project');assert.equal(host.guideDispatches.length,0);
-  assert.equal((await host.tool('remember_wechat',{request_id:event.requestId,text:'prefers tea',session_context:{session_id:'foreign'}})).ok,false);
-  assert.equal((await host.tool('remember_wechat',{request_id:event.requestId,text:'prefers tea',session_context:{session_id:'session-a'}})).ok,true);
+  assert.equal((await host.tool('remember_wechat',{text:'prefers tea',session_context:{session_id:'foreign'}})).ok,false);
+  assert.equal((await host.tool('remember_wechat',{text:'prefers tea',session_context:{session_id:'session-a'}})).ok,true);
   assert.equal(JSON.parse(shared.memoryFiles['bot-memory-a.json']).text,'prefers tea');
   assert.equal((await host.tool('send_to_wechat',{id:'a',text:'bad',session_context:{session_id:'session-a'}})).ok,false);
-  assert.equal((await host.tool('reply_to_wechat',{request_id:event.requestId,text:'answer',session_context:{session_id:'session-a'}})).ok,true);
+  assert.equal((await host.tool('reply_to_wechat',{text:'answer',session_context:{session_id:'session-a'}})).ok,true);
   host.manager.close();host=makeHost(shared);
   try {
-    await host.tool('list_bindings');const current=await receive(host,901);assert.equal(JSON.parse(host.dispatches[0].context).memory,'prefers tea');
+    await host.tool('list_bindings');const current=await receive(host,901);assert.equal(host.dispatches[0].context,undefined); assert.equal((await host.tool('read_wechat_memory',{session_context:{session_id:'session-a'}})).result.text,'prefers tea');
     assert.equal((await host.ui('clear_memory',{id:'a'})).ok,true);
     const late=await host.tool('remember_wechat',{request_id:current.requestId,text:'restore old memory',session_context:{session_id:'session-a'}});
     assert.equal(late.errorCode,'MEMORY_CLEARED');assert.equal(JSON.parse(shared.memoryFiles['bot-memory-a.json']).text,'');

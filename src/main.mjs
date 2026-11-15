@@ -16,6 +16,7 @@ let legacyMemories = {}, memoryErrors = {};
 let startupError = null;
 let pendingConfiguration = false;
 const uiCalls = new Map();
+const memoryCalls = new Map();
 async function node(method, params = {}, msg) {
   const response = await cindy.node.request({ method, params, timeoutMs: method === 'reply' || method === 'auth/check' ? 120000 : 45000,
     ...(method === 'reply' ? { maxTotalMs: 240000 } : {}),
@@ -137,7 +138,7 @@ async function snapshot() {
   catch (err) { capabilityError = { code: err.code ?? 'TARGET_UNAVAILABLE', message: '伙伴列表不可用，仍可停用或删除已有绑定。' }; }
   const bindingGuides = [];
   for (const bot of config.bots) if (!botProjectMode(bot, config.execution)) bindingGuides.push(await guides.refresh(bot));
-  return { plugin: { id: 'wechat-companion', name: '微信伙伴', version: '0.4.2' }, config, runtime, nodeStarting: booting, companions, bindingGuides, memories: config.bots.map(bot => ({ ...memories.status(bot.id), error: memoryErrors[bot.id] })), startupError, dispatchRetries: router.pendingRetries(), recoveryError, capabilityError, storageWarning: store.lastWarning };
+  return { plugin: { id: 'wechat-companion', name: '微信伙伴', version: '0.4.3' }, config, runtime, nodeStarting: booting, companions, bindingGuides, memories: config.bots.map(bot => ({ ...memories.status(bot.id), error: memoryErrors[bot.id] })), startupError, dispatchRetries: router.pendingRetries(), recoveryError, capabilityError, storageWarning: store.lastWarning };
 }
 async function command(action, args = {}, msg) {
   await loadConfig();
@@ -203,10 +204,23 @@ async function command(action, args = {}, msg) {
       delete memoryErrors[args.id]; delete legacyMemories[args.id];
       return { memory: memories.status(args.id) };
     }
+    case 'read_wechat_memory':
     case 'remember_wechat': {
-      const entry = router.requests.get(args.request_id);
+      const sessionId = msg?.args?.session_context?.session_id;
+      const candidates = [...router.current.values()].map(id => router.requests.get(id)).filter(entry => entry?.execution && entry.state === 'accepted' && entry.sessionId === sessionId);
+      if (!sessionId || candidates.length !== 1) fail('WRONG_COMPANION', '当前会话没有唯一有效的微信请求。');
+      const entry = candidates[0];
+      if (Date.now() - entry.createdAt > 30 * 60000) fail('REQUEST_EXPIRED', '当前微信请求已过期。');
+      if (msg?.callId) {
+        const pinned = memoryCalls.get(msg.callId);
+        if (pinned && (pinned.requestId !== entry.requestId || pinned.sessionId !== sessionId)) fail('WRONG_COMPANION', '不能将旧调用转到新的微信请求。');
+        memoryCalls.set(msg.callId, { requestId: entry.requestId, sessionId });
+        if (memoryCalls.size > 512) memoryCalls.delete(memoryCalls.keys().next().value);
+      }
+      if (args.request_id !== undefined && args.request_id !== entry.requestId) fail('WRONG_COMPANION', '只能操作本轮微信请求的记忆。');
       if (!entry?.execution || entry.state !== 'accepted' || entry.sessionId !== msg?.args?.session_context?.session_id || router.current.get(entry.botConfigId) !== entry.requestId)
         fail('WRONG_COMPANION', '只能更新当前微信请求所属 Bot 的记忆。');
+      if (action === 'read_wechat_memory') return { text: memories.get(entry.botConfigId).text };
       if (typeof args.text !== 'string' || args.text.length > 4000) fail('INVALID_INPUT', '记忆最多 4000 字符。');
       if (entry.memoryRevision !== memories.get(entry.botConfigId).revision) fail('MEMORY_CLEARED', '此 Bot 的记忆已被手动清空，旧请求不能重新写回。');
       const previous = memories.records[entry.botConfigId]; memories.set(entry.botConfigId, args.text);
@@ -310,7 +324,7 @@ cindy.onHostMessage(async msg => {
   if (msg.type !== 'tool-call') return;
   try {
     await loadConfig(); let result;
-    if (projectSessions.includes(msg.args.session_context?.session_id) && !['reply_to_wechat', 'remember_wechat'].includes(msg.tool))
+    if (projectSessions.includes(msg.args.session_context?.session_id) && !['reply_to_wechat', 'remember_wechat', 'read_wechat_memory'].includes(msg.tool))
       fail('WRONG_COMPANION', '微信项目任务只能回传当前请求或更新自身记忆。');
     if (msg.tool === 'reply_to_wechat') {
       await init();

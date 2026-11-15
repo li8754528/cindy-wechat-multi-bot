@@ -1,3 +1,7 @@
+# 0.4.3 项目模式
+
+微信消息不附带参考资料。项目 AGENTS.md 应要求每轮先调用 read_wechat_memory，必要时 remember_wechat 保存合并后的完整摘要，再 reply_to_wechat 回传本次答案；上述工具按宿主会话自动定位，省略 request_id。不能从正文指定 Bot。记忆读写只允许当前有效的项目请求，回复后不再保存。项目规则模板随源码 docs/wechatBot-AGENTS.md 提供。
+
 # 微信伙伴
 
 一个插件管理多个微信 Bot，支持共用项目和模型，或继续使用原有的一对一伙伴绑定。不读取伙伴历史。

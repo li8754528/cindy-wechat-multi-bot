@@ -1,3 +1,7 @@
+# 0.4.3 自动定位与纯消息
+
+项目投递不再附带 context，微信原文保持不变。reply_to_wechat 与 remember_wechat 可省略 request_id；新增 read_wechat_memory，按宿主会话及当前有效请求定位 Bot。每轮先读取、必要时合并保存摘要，最后回传。已有 AGENTS.md 应采用 wechatBot-AGENTS.md 模板；本文下方为历史版本说明。
+
 # 会话续聊与权限
 
 项目任务默认完全访问，可在插件设置选择询问或自动审批。会话时限为 1–24 小时，默认 2 小时，按最近成功投递计算。不同 Bot、联系人及执行配置独立；插件重启后新建会话，Bot 长期记忆持久保留。微信项目说明模板见 wechatBot-AGENTS.md，实际已写入相邻 wechatBot/AGENTS.md。
