@@ -1,6 +1,6 @@
 {
   "name": "cindy-wechat-multi-bot",
-  "version": "0.3.6",
+  "version": "0.4.2",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,5 +8,8 @@
     "test": "node --test tests/*.test.mjs",
     "check": "node scripts/check.mjs"
   },
-  "devDependencies": { "esbuild": "^0.25.12", "qrcode": "^1.5.4" }
+  "devDependencies": {
+    "esbuild": "^0.25.12",
+    "qrcode": "^1.5.4"
+  }
 }

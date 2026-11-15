@@ -6,7 +6,9 @@ h1, h2, h3, p { margin: 0; }
 h1 { font-size: 18px; }
 h2 { font-size: 16px; }
 h3 { font-size: 14px; }
-button, input { font: inherit; color: inherit; }
+button, input, select { font: inherit; color: inherit; }
+select { width: 100%; padding: 8px; margin: 8px 0 12px; background: var(--surface, transparent); border: 1px solid var(--border-default, currentColor); border-radius: 8px; }
+#execution-summary { overflow-wrap: anywhere; margin-top: 10px; }
 button { padding: 8px 12px; border: 1px solid var(--border-default, currentColor); border-radius: 9px; background: var(--surface, transparent); cursor: pointer; max-width: 100%; }
 button:hover:not(:disabled) { border-color: var(--text-secondary, currentColor); }
 button:disabled { opacity: .5; cursor: default; }

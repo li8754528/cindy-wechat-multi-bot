@@ -7,6 +7,90 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const { BotManager } = require('../src/worker.cjs');
 const code = () => readFileSync('wechat-companion/main.js', 'utf8');
+test('per-Bot choice and model are saved independently and survive rename', async t => {
+  const route={agentKind:'codex',providerId:'local',model:'default',effort:'high',fastMode:false};
+  const shared={config:{execution:{project:'C:/project',route},bots:[{id:'a',name:'A',companionId:'buddy-a',enabled:false},{id:'b',name:'B',companionId:'buddy-b',enabled:false}]}};
+  const host=makeHost(shared);t.after(()=>host.manager.close());
+  assert.equal((await host.ui('save_bot_route',{id:'a',mode:'companion',companionId:'buddy-a'})).ok,true);
+  const custom={...route,model:'custom',effort:'low'};
+  assert.equal((await host.ui('save_bot_route',{id:'b',mode:'project',execution:{project:'',route:custom}})).ok,true);
+  assert.equal(shared.config.bots[0].mode,'companion');assert.equal(shared.config.bots[1].execution.route.model,'custom');
+  assert.equal(shared.config.execution.route.model,'default');
+  await host.ui('pick_model',{id:'b'},'remote');assert.equal(shared.pickerOptions.initial.model,'custom');assert.equal(shared.pickerOptions.mobilePageId,'remote');
+  assert.equal((await host.ui('upsert_binding',{id:'b',name:'renamed',companion_id:'buddy-b',enabled:false})).ok,true);
+  assert.equal(shared.config.bots[1].mode,'project');assert.equal(shared.config.bots[1].execution.route.effort,'low');
+  assert.equal((await host.ui('save_bot_route',{id:'b',execution:{project:'',route:null}})).ok,true);
+  assert.equal(shared.config.bots[1].execution.route,null);
+});
+test('completing project settings with an unpaired Bot preserves another Bot in-flight reply', async t => {
+  const shared={config:{bots:[{id:'a',name:'A',companionId:'buddy-a',enabled:true},{id:'b',name:'B',companionId:'',enabled:false}]},key:null,file:null};
+  const host=makeHost(shared);t.after(()=>host.manager.close());
+  await host.tool('begin_login',{id:'a'});await host.tool('check_login',{id:'a'});
+  const state=host.manager.bot('a');const event=host.manager.ingest(state,state.generation,{message_id:990,message_type:1,from_user_id:'peer',context_token:'context',item_list:[{type:1,text_item:{text:'hello'}}]},false);
+  host.manager.notifyInbound(await host.manager.prepareInbound(event));await host.drainEvents();
+  const saved=await host.ui('save_execution',{project:'C:/project',route:{agentKind:'codex',providerId:'local',model:'test',effort:'high',fastMode:false}});
+  assert.equal(saved.ok,true);assert.equal(shared.config.bots[1].companionId,'project-b');
+  const reply=await host.tool('reply_to_wechat',{request_id:event.requestId,text:'answer',session_context:{session_id:'session-a'}});
+  assert.equal(reply.ok,true);assert.equal(host.deliveries.length,1);
+});
+test('a corrupt Bot memory can be manually cleared without blocking other settings', async t => {
+  const shared={config:{bots:[{id:'a',name:'A',companionId:'buddy-a',enabled:false}]},memoryFiles:{'bot-memory-a.json':'broken-json'},nodeStartupFailure:true};
+  const host=makeHost(shared);t.after(()=>host.manager.close());
+  const snapshot=await host.ui('list_bindings');assert.equal(snapshot.ok,true);assert.ok(snapshot.result.memories[0].error);
+  assert.equal((await host.ui('clear_memory',{id:'a'})).ok,true);
+  assert.equal(JSON.parse(shared.memoryFiles['bot-memory-a.json']).text,'');
+  assert.equal((await host.ui('list_bindings')).result.memories[0].error,undefined);
+});
+test('remote model and directory choices preserve the initiating page and directory saves immediately', async t => {
+  const shared={config:{bots:[]},nodeStartupFailure:true};const host=makeHost(shared);t.after(()=>host.manager.close());
+  await host.ui('pick_model',{},'remote-page');assert.equal(shared.pickerOptions.mobilePageId,'remote-page');
+  await host.ui('pick_model');assert.equal(shared.pickerOptions.mobilePageId,undefined);
+  const picked=await host.ui('pick_project',{},'remote-page');assert.equal(picked.ok,true);assert.equal(picked.result.ok,true);
+  assert.equal(shared.workspaceOptions.mobilePageId,'remote-page');assert.equal(shared.workspaceOptions.mode,'pick');
+  assert.equal(shared.config.execution.project,'C:/picked-project');assert.equal(shared.config.execution.route,null);
+  shared.workspaceResult={ok:false,errorCode:'CANCELLED'};const cancelled=await host.ui('pick_project',{},'remote-page');
+  assert.equal(cancelled.result.errorCode,'CANCELLED');assert.equal(shared.config.execution.project,'C:/picked-project');
+});
+test('settings and single-Bot clear remain usable when Node startup fails', async t => {
+  const shared={config:{bots:[{id:'a',name:'A',companionId:'buddy-a',enabled:false},{id:'b',name:'B',companionId:'buddy-b',enabled:false}],botMemories:{a:{text:'tea'},b:{text:'coffee'}}},nodeStartupFailure:true};
+  const host=makeHost(shared);t.after(()=>host.manager.close());
+  const state=await host.ui('list_bindings');assert.equal(state.ok,true);assert.equal(state.result.config.bots.length,2);
+  assert.equal((await host.ui('list_projects')).ok,true);
+  assert.equal((await host.ui('save_execution',{project:'C:/project'})).ok,true);
+  assert.equal(shared.config.execution.project,'C:/project');assert.equal(shared.config.execution.route,null);
+  assert.equal((await host.ui('save_execution',{route:{agentKind:'codex',providerId:'local',model:'test',effort:'high',fastMode:false}})).ok,true);
+  assert.equal(shared.config.execution.project,'C:/project');
+  assert.equal((await host.ui('clear_memory',{id:'a'})).ok,true);
+  assert.equal(JSON.parse(shared.memoryFiles['bot-memory-a.json']).text,'');assert.equal(JSON.parse(shared.memoryFiles['bot-memory-b.json']).text,'coffee');
+  assert.equal((await host.ui('clear_memory',{id:'missing'})).ok,false);
+});
+test('project mode persists Bot memory, restores it on restart and rejects foreign task writes and proactive sends', async () => {
+  const shared = { config: { execution: { project: 'C:/project', route: { agentKind: 'codex', providerId: 'local', model: 'test', effort: 'high', fastMode: false } },
+    bots: [{ id:'a',name:'A',companionId:'buddy-a',enabled:true }] }, key:null,file:null };
+  let host=makeHost(shared);
+  await host.tool('list_bindings'); await host.tool('begin_login',{id:'a'}); await host.tool('check_login',{id:'a'});
+  const receive=async (h,id) => {
+    const state=h.manager.bot('a');
+    const event=h.manager.ingest(state,state.generation,{message_id:id,message_type:1,from_user_id:'peer',context_token:'context',item_list:[{type:1,text_item:{text:'hello'}}]},false);
+    h.manager.notifyInbound(await h.manager.prepareInbound(event));await h.drainEvents();return event;
+  };
+  const event=await receive(host,900);
+  assert.equal((await host.ui('save_bot_route',{id:'a',mode:'companion'})).code,'ROUTE_BUSY');
+  assert.equal(host.dispatches[0].target.kind,'project');assert.equal(host.guideDispatches.length,0);
+  assert.equal((await host.tool('remember_wechat',{request_id:event.requestId,text:'prefers tea',session_context:{session_id:'foreign'}})).ok,false);
+  assert.equal((await host.tool('remember_wechat',{request_id:event.requestId,text:'prefers tea',session_context:{session_id:'session-a'}})).ok,true);
+  assert.equal(JSON.parse(shared.memoryFiles['bot-memory-a.json']).text,'prefers tea');
+  assert.equal((await host.tool('send_to_wechat',{id:'a',text:'bad',session_context:{session_id:'session-a'}})).ok,false);
+  assert.equal((await host.tool('reply_to_wechat',{request_id:event.requestId,text:'answer',session_context:{session_id:'session-a'}})).ok,true);
+  host.manager.close();host=makeHost(shared);
+  try {
+    await host.tool('list_bindings');const current=await receive(host,901);assert.equal(JSON.parse(host.dispatches[0].context).memory,'prefers tea');
+    assert.equal((await host.ui('clear_memory',{id:'a'})).ok,true);
+    const late=await host.tool('remember_wechat',{request_id:current.requestId,text:'restore old memory',session_context:{session_id:'session-a'}});
+    assert.equal(late.errorCode,'MEMORY_CLEARED');assert.equal(JSON.parse(shared.memoryFiles['bot-memory-a.json']).text,'');
+  }
+  finally {host.manager.close();}
+});
 function makeHost(shared) {
   if (!shared.legacyGuides && !shared.config.bindingGuides) shared.config.bindingGuides = shared.config.bots.filter(bot => bot.companionId).map(bot =>
     ({ botId: bot.id, companionId: bot.companionId, key: `wx-guide-fixture-${bot.id}`, state: 'ready', sessionId: 'session-a' }));
@@ -36,11 +120,13 @@ function makeHost(shared) {
     throw new Error('Unexpected simulated Host URL');
   };
   const cindy = {
+    pickModel: async options => { shared.pickerOptions = options; return { ok:false,errorCode:'CANCELLED' }; },
+    workspace: async options => { shared.workspaceOptions = options; return shared.workspaceResult ?? {ok:true,sessionId:'workspace-task'}; },
     onHostMessage: handler => handlers.push(handler), send: async msg => { results.push(msg); return {}; },
-    tasks: { capabilities: async () => ({ messageContext: shared.messageContext ?? true, messageAttachments: { kinds: ['image'] } }) },
+    tasks: { capabilities: async () => ({ createPermissionMode: true, messageContext: shared.messageContext ?? true, messageAttachments: { kinds: ['image'] } }) },
     companions: { reply: () => { throw new Error('Must not read companion replies'); }, history: () => { throw new Error('Must not read companion history'); } },
     targets: { capabilities: async () => ({ delegation: { execution: true, receiptQuery: shared.receiptQuery ?? true, settled: shared.receiptQuery ?? true } }),
-      resolve: async ({ target }) => target, list: async () => ({ targets: [{ id: 'buddy-a', label: 'A' }] }),
+      resolve: async ({ target }) => target, list: async ({targetKind}) => ({ targets: targetKind === 'task' ? [{id:'workspace-task',detail:'C:/picked-project'}] : [{ id: 'buddy-a', label: 'A' }] }),
       send: async req => { (req.requestKey.startsWith('wx-guide-') ? guideDispatches : dispatches).push(req);
         if (!req.requestKey.startsWith('wx-guide-') && shared.failDispatchCount > 0) { shared.failDispatchCount--; failedKeys.add(req.requestKey); throw Object.assign(new Error('host not ready'), { code: 'HOST_NOT_READY' }); }
         return { accepted: true, taskId: 'session-a', executionId: `execution-${req.requestKey}` }; },
@@ -55,11 +141,17 @@ function makeHost(shared) {
         target: { kind: 'bot', id: 'buddy-a' }, status: 'accepted', settled: shared.settled === true,
         result: Object.hasOwn(shared, 'terminalResult') ? shared.terminalResult : { outcome: 'completed', outputMessageId: 'desktop-output' } }; } },
     fs: async req => {
+      if (req.path.startsWith('bot-memory-')) {
+        shared.memoryFiles ??= {};
+        if (req.op === 'read') return shared.memoryFiles[req.path] ? {ok:true,content:shared.memoryFiles[req.path]} : {ok:false,errorCode:'NOT_FOUND'};
+        if (req.op === 'write') { shared.memoryFiles[req.path]=req.content;return {ok:true}; }
+      }
       if (req.op === 'read') return shared.file ? { ok: true, content: shared.file } : { ok: false, errorCode: 'NOT_FOUND' };
       if (req.op === 'delete' && shared.failDelete) return { ok: false, message: 'test deletion failed' };
       if (req.op === 'write') shared.file = req.content; if (req.op === 'delete') shared.file = null; return { ok: true };
     },
     node: { request: async ({ method, params, timeoutMs, maxTotalMs }) => {
+      if (shared.nodeStartupFailure) throw Object.assign(new Error('Node工作进程启动超时'), { code: 'NODE_START_TIMEOUT' });
       assert.ok(Buffer.byteLength(JSON.stringify(params)) <= 256 * 1024, 'Host params size limit');
       assert.ok(timeoutMs >= 1000 && timeoutMs <= 120000, 'Host timeout range');
       if (maxTotalMs) assert.ok(maxTotalMs >= timeoutMs && maxTotalMs <= 900000, 'Host total timeout range');
@@ -105,8 +197,8 @@ function makeHost(shared) {
     tickReceipt: async () => { const timer = timers.shift(); assert.ok(timer); await timer.callback(); },
     hostMessage: async msg => { for (const handler of handlers) await handler(msg); },
     drainEvents: async () => { await Promise.all(notifications.splice(0)); }, event: async (method, params) => { for (const handler of handlers) await handler({ type: 'event', name: 'node-notification', method, params }); },
-    get qrCalls() { return qrCalls; }, ui: async (action, args = {}) => {
-      const id = webcrypto.randomUUID(); await channels[0].onmessage({ data: { type: 'ui-request', id, action, args } });
+    get qrCalls() { return qrCalls; }, ui: async (action, args = {}, mobilePageId) => {
+      const id = webcrypto.randomUUID(); await channels[0].onmessage({ data: { type: 'ui-request', id, action, args, ...(mobilePageId ? {mobilePageId} : {}) } });
       assert.equal(channels[0].last.id, id); return channels[0].last;
     }, tool: async (tool, args = {}) => {
     const callId = `call-${sequence++}`; for (const handler of handlers) await handler({ type: 'tool-call', tool, args, callId });

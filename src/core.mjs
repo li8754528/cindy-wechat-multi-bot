@@ -1,3 +1,4 @@
+import { projectSettings, projectContext, executionReady, botExecution, botProjectMode } from './project-settings.mjs';
 export function fail(code, message) {
   throw Object.assign(new Error(message), { code });
 }
@@ -6,7 +7,8 @@ export function validateConfig(value) {
   const bots = value.bots ?? [];
   if (!Array.isArray(bots) || bots.length > 32) fail('INVALID_CONFIG', '最多配置 32 组 Bot。');
   const ids = new Set(), companions = new Set();
-  return { schemaVersion: 1, bots: bots.map(bot => {
+  const execution = projectSettings(value.execution);
+  return { schemaVersion: 1, ...(execution ? { execution } : {}), bots: bots.map(bot => {
     if (!bot || !/^[a-zA-Z0-9_-]{1,48}$/.test(bot.id ?? '') ||
         typeof bot.name !== 'string' || !bot.name.trim() || bot.name.length > 60 ||
         typeof bot.companionId !== 'string' || bot.companionId.length > 200 ||
@@ -14,8 +16,12 @@ export function validateConfig(value) {
         typeof bot.enabled !== 'boolean') fail('INVALID_CONFIG', '每组需要有效的标识、名称、伙伴和启用状态。');
     if (ids.has(bot.id) || bot.companionId && companions.has(bot.companionId)) fail('DUPLICATE_BINDING', '每个 Bot 和每个伙伴只能出现在一组绑定中。');
     ids.add(bot.id); if (bot.companionId) companions.add(bot.companionId);
+    if (bot.mode !== undefined && !['project', 'companion'].includes(bot.mode)) fail('INVALID_CONFIG', '请选择项目或伙伴模式。');
+    const ownExecution = projectSettings(bot.execution);
     // Whitelist persisted fields: tokens and arbitrary extra fields never reach /kv.
-    return { id: bot.id, name: bot.name.trim(), companionId: bot.companionId, enabled: bot.enabled };
+    return { id: bot.id, name: bot.name.trim(), companionId: bot.companionId,
+      ...(bot.mode ? { mode: bot.mode } : {}), ...(ownExecution ? { execution: ownExecution } : {}),
+      enabled: bot.enabled && (!!botExecution(bot, execution) || bot.companionId !== `project-${bot.id}`) };
   }) };
 }
 
@@ -23,20 +29,26 @@ export function validateConfig(value) {
 // sends have an explicit tool and only use peers already known to the Node worker.
 // Neither path reads companion history.
 const DISPATCH_RETRY_DELAYS = [3 * 60000, 10 * 60000];
-const NON_RETRYABLE_DISPATCH = new Set(['PERMISSION_DENIED', 'UNSUPPORTED_CAPABILITY', 'INVALID_PARAMS',
+const NON_RETRYABLE_DISPATCH = new Set(['MEMORY_READ_FAILED', 'PERMISSION_DENIED', 'UNSUPPORTED_CAPABILITY', 'INVALID_PARAMS',
   'INVALID_INPUT', 'BINDING_CHANGED', 'STALE_CONNECTION', 'REQUEST_EXPIRED', 'REQUEST_KEY_CONFLICT', 'SUPERSEDED']);
+const matchesTarget = (receipt, entry) => entry.dispatchTarget ? receipt.target?.kind === entry.dispatchTarget.kind && receipt.target.id === entry.dispatchTarget.id : entry.execution
+  ? receipt.target?.kind === 'project' && receipt.target.id === entry.execution.project
+  : receipt.target?.kind === 'bot' && receipt.target.id === entry.companionId;
 export class ReplyRouter {
-  constructor({ targets, tasks, nodeReply, rejectInbound, readImages = async () => [], beforeDispatch = async () => {},
+  constructor({ targets, tasks, nodeReply, rejectInbound, readImages = async () => [], beforeDispatch = async () => {}, onProjectSession = async () => {},
     setTimer = (...args) => globalThis.setTimeout(...args),
     clearTimer = (...args) => globalThis.clearTimeout(...args), now = Date.now }) {
     this.targets = targets; this.nodeReply = nodeReply; this.rejectInbound = rejectInbound;
     this.tasks = tasks; this.readImages = readImages; this.beforeDispatch = beforeDispatch;
+    this.onProjectSession = onProjectSession;
     this.setTimer = setTimer; this.clearTimer = clearTimer; this.now = now;
     this.routes = new Map(); this.requests = new Map(); this.lanes = new Map(); this.current = new Map(); this.generations = new Map();
     this.inboundTails = new Map(); this.inboundEpochs = new Map(); this.resetEpoch = 0;
-    this.bindingSessions = new Map(); this.replyCalls = new Map(); this.sendCalls = new Map();
+    this.projectConversations = new Map(); this.bindingSessions = new Map(); this.replyCalls = new Map(); this.sendCalls = new Map();
   }
   setConfig(config) {
+    this.defaults = config.execution;
+    this.execution = executionReady(config.execution) ? config.execution : undefined;
     const next = new Map(config.bots.map(bot => [bot.id, bot]));
     for (const [id, route] of this.routes) {
       const replacement = next.get(id);
@@ -50,7 +62,7 @@ export class ReplyRouter {
     this.routes = next;
   }
   reset() {
-    this.resetEpoch++; this.inboundTails.clear(); this.inboundEpochs.clear();
+    this.projectConversations.clear(); this.resetEpoch++; this.inboundTails.clear(); this.inboundEpochs.clear();
     for (const entry of this.requests.values()) { entry.state = 'cancelled'; entry.finish?.(); }
     this.requests.clear(); this.lanes.clear(); this.current.clear(); this.generations.clear();
     this.bindingSessions.clear(); this.replyCalls.clear(); this.sendCalls.clear();
@@ -109,7 +121,7 @@ export class ReplyRouter {
       try {
         const receipt = await this.targets.get({ requestKey: `wx-${old.requestId}` });
         if (!(receipt?.found === false || receipt?.found === true && receipt.requestKey === `wx-${old.requestId}` &&
-          receipt.target?.kind === 'bot' && receipt.target.id === old.companionId && receipt.status === 'pending')) return message;
+          matchesTarget(receipt, old) && receipt.status === 'pending')) return message;
         try { withdrawal = await this.targets.cancel({ requestKey: `wx-${old.requestId}` }); }
         catch { /* Cancellation ACK may be lost. Fence the old request until the receipt confirms settlement. */ }
         withdrawal ??= {};
@@ -140,7 +152,7 @@ export class ReplyRouter {
         const receipt = await this.targets.get({ requestKey: `wx-${entry.requestId}` });
         if (entry.state !== 'withdrawing' || this.requests.get(entry.requestId) !== entry) return;
         if (receipt?.found === true && receipt.requestKey === `wx-${entry.requestId}` &&
-          receipt.target?.kind === 'bot' && receipt.target.id === entry.companionId && receipt.status === 'cancelled' && receipt.settled === true) {
+          matchesTarget(receipt, entry) && receipt.status === 'cancelled' && receipt.settled === true) {
           entry.state = 'superseded'; entry.finish();
           try { await this.rejectInbound(entry.requestId, 'REQUEST_SUPERSEDED'); } catch {}
           return;
@@ -173,7 +185,9 @@ export class ReplyRouter {
       !currentRoute?.enabled || currentRoute.companionId !== bot.companionId || this.generations.get(message.botConfigId) !== message.generation) {
       await this.rejectInbound(message.requestId, 'BINDING_CHANGED'); return;
     }
-    const entry = { ...message, companionId: bot.companionId, createdAt: this.now(), state: 'queued' };
+    const execution = botExecution(bot, this.defaults);
+    if (botProjectMode(bot, this.defaults) && !execution) { await this.rejectInbound(message.requestId, 'INVALID_PARAMS'); return; }
+    const entry = { ...message, execution, companionId: bot.companionId, createdAt: this.now(), state: 'queued' };
     this.requests.set(message.requestId, entry);
     const previous = this.lanes.get(entry.botConfigId);
     entry.done = new Promise(resolve => { entry.finish = () => {
@@ -229,6 +243,7 @@ export class ReplyRouter {
   }
   async dispatch(entry) {
     await this.beforeDispatch(entry);
+    if (entry.execution) return this.dispatchProject(entry);
     const caps = await this.targets.capabilities({});
     if (caps?.delegation?.execution !== true) fail('UNSUPPORTED_CAPABILITY', '宿主没有可执行的伙伴委派接口，请检查 Cindy 版本与授权。');
     if (entry.attachments?.length) {
@@ -252,6 +267,38 @@ export class ReplyRouter {
     entry.attachments = undefined; entry.parts = undefined;
     entry.requestKey = requestKey; entry.executionId = receipt.executionId;
     if (caps.delegation.receiptQuery === true && caps.delegation.settled === true && typeof this.targets.get === 'function') {
+      entry.monitorReceipt = true; entry.receiptPoll = 0; this.scheduleReceipt(entry);
+    }
+    return receipt;
+  }
+  async dispatchProject(entry) {
+    if (!entry.execution.project || !entry.execution.route) fail('INVALID_PARAMS', '请在插件设置中选择项目、模型与推理档位。');
+    const caps = await this.tasks?.capabilities?.({});
+    if (!caps?.messageContext) fail('UNSUPPORTED_CAPABILITY', '当前 Cindy 不支持项目消息上下文，请更新后重试。');
+    const key = JSON.stringify([entry.botConfigId, entry.peerId, entry.execution]);
+    const previous = this.projectConversations.get(key);
+    entry.dispatchTarget ??= previous && this.now() - previous.at < (entry.execution.sessionHours ?? 2) * 3600000
+      ? { kind: 'task', id: previous.id } : { kind: 'project', id: entry.execution.project };
+    const target = entry.dispatchTarget;
+    if (target.kind === 'project' && entry.execution.permissionMode && !caps.createPermissionMode) fail('UNSUPPORTED_CAPABILITY', '当前 Cindy 不支持设置新任务权限，请更新后重试。');
+    await this.targets.resolve({ target });
+    if (entry.attachments?.length && !(await this.tasks?.capabilities?.({}))?.messageAttachments?.kinds?.includes('image'))
+      fail('UNSUPPORTED_CAPABILITY', '当前 Cindy 不支持项目任务接收图片。');
+    if (entry.state !== 'dispatching') fail('BINDING_CHANGED', '请求已失效。');
+    entry.projectContext ??= projectContext(entry, entry.memory ?? '');
+    entry.sendAttempted = true;
+    const receipt = await this.targets.send({ target, requestKey: `wx-${entry.requestId}`, text: entry.text,
+      context: entry.projectContext, ...(target.kind === 'project' ? { route: entry.execution.route, ...(entry.execution.permissionMode ? { permissionMode: entry.execution.permissionMode } : {}) } : {}), title: '微信 · ' + entry.botConfigId,
+      delivery: 'queue', ...(entry.attachments?.length ? { attachments: entry.attachments } : {}) });
+    if (receipt?.accepted !== true || !receipt.taskId) fail('DELIVERY_UNCERTAIN', '项目任务未返回明确受理回执，请在 Cindy 检查。');
+    this.projectConversations.set(key, { id: receipt.taskId, at: this.now() });
+    await this.onProjectSession(receipt.taskId);
+    if (entry.state !== 'dispatching') fail('BINDING_CHANGED', '请求已失效。');
+    entry.sessionId = receipt.taskId; entry.state = 'accepted';
+    this.bindSession(entry.botConfigId, entry.companionId, receipt.taskId);
+    entry.attachments = undefined; entry.parts = undefined;
+    entry.requestKey = `wx-${entry.requestId}`;
+    if (typeof this.targets.get === 'function') {
       entry.monitorReceipt = true; entry.receiptPoll = 0; this.scheduleReceipt(entry);
     }
     return receipt;
@@ -282,7 +329,7 @@ export class ReplyRouter {
       const receipt = await this.targets.get({ requestKey: entry.requestKey });
       if (!this.receiptActive(entry)) return;
       if (receipt?.found === true && receipt.requestKey === entry.requestKey && receipt.taskId === entry.sessionId &&
-          receipt.target?.kind === 'bot' && receipt.target.id === entry.companionId &&
+          matchesTarget(receipt, entry) &&
           (!entry.executionId || receipt.executionId === entry.executionId) && receipt.settled === true) {
         let code = 'ENDED_WITHOUT_REPLY';
         switch (receipt.result?.outcome) {

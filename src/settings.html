@@ -20,8 +20,17 @@
     </div>
   </div>
   <div id="notice" role="status" aria-live="polite" hidden></div>
+  <section class="editor">
+    <h2>默认项目与模型</h2>
+    <p class="muted">项目模式的默认设置，选择即保存。每个 Bot 可转接伙伴，或单独选择项目模型与推理档位。</p>
+    <label for="default-project">项目</label><select id="default-project"><option value="">请选择项目</option></select>
+    <div class="actions"><button id="load-projects" type="button">刷新项目</button><button id="pick-project" type="button">选择目录</button><button id="pick-model" type="button">选择模型与推理档位</button></div>
+    <p class="muted">选择目录会在 Cindy 中打开该项目，可能创建一个空任务；不会启动 AI。</p>
+    <label>会话续聊时限（小时）<input id="session-hours" type="number" min="1" max="24" value="2"></label><label>新任务权限<select id="permission-mode"><option value="bypassPermissions">完全访问</option><option value="auto">自动审批</option><option value="ask">询问</option></select></label>
+    <p id="execution-summary" class="muted"></p>
+  </section>
   <div id="recovery" class="recovery" hidden>
-    <p id="recovery-message"></p><button id="retry-save" type="button">重试保存登录</button>
+    <p id="recovery-message"></p><button id="retry-save" type="button">重试保存登录</button><button id="retry-connection" type="button" hidden>重试连接进程</button>
   </div>
   <section id="editor" class="editor" aria-labelledby="editor-title" hidden>
     <div class="section-heading">
@@ -57,7 +66,7 @@
   <div id="bots" class="bots" aria-label="微信 Bot 列表"></div>
   <details class="help">
     <summary>使用说明</summary>
-    <p>每个 Bot 绑定一位不同的伙伴，回答沿用伙伴自己的模型和权限。支持文字和图片；语音请先在微信转成文字再发送。</p>
+    <p>每个 Bot 可独立选择项目回答或转接伙伴。项目模式可单独选择模型与推理档位；伙伴模式沿用伙伴自己的模型和权限。支持文字和图片；语音请先在微信转成文字再发送。</p>
     <p>“暂停聊天”会保留登录，“退出登录”会清除这个 Bot 的登录记录。电脑保持 Cindy 运行并联网，即可接收消息。</p>
     <p>同一个微信 Bot 只能连接一处。已在 Cindy 内置微信或其他地方连接的 Bot，请先解绑，或换一个 Bot 扫码。</p>
   </details>

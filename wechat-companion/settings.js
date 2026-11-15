@@ -1,11 +1,14 @@
 const channel = new BroadcastChannel('wechat-companion-control-v1'), pending = new Map();
 let view = { config: { bots: [] }, runtime: { bots: [] }, companions: [] };
 let editor = null, loginGeneration = 0, busy = false, loaded = false, disposed = false;
+let startupPoll;
 const $ = id => document.getElementById(id);
-const labels = { disconnected: '未登录', waiting_scan: '等待扫码', scanned: '已扫码，请在微信确认', connected: '聊天中',
+const projectMode = bot => bot?.mode === 'project' || (bot?.mode !== 'companion' && !!view.config.execution?.project?.trim() && !!view.config.execution?.route);
+const labels = { starting: '正在启动连接', disconnected: '未登录', waiting_scan: '等待扫码', scanned: '已扫码，请在微信确认', connected: '聊天中',
   paused: '已暂停聊天', qr_expired: '二维码已过期', error: '连接出错', reconnecting: '正在重连', needs_login: '需要重新登录',
   login_requires_action: '需要微信侧处理', storage_error: '登录保存失败', saving_login: '正在保存登录', disconnecting: '正在退出登录' };
 const messageErrors = { VOICE_UNSUPPORTED: '暂不支持语音，请使用微信语音转文字后发送',
+  MEMORY_READ_FAILED: '此 Bot 的记忆读取失败，请在“管理 Bot”中检查或清空记忆，再从微信重发消息',
   VOICE_TRANSCRIPT_MISSING: '暂不支持语音，请使用微信语音转文字后发送',
   TOO_MANY_IMAGES: '单条最多 4 张图片，请分开发送', MEDIA_INBOX_FULL: '等待处理的图片过多，请稍后重发',
   INVALID_IMAGE: '图片无效或解密失败，请重发 PNG/JPEG/WebP 图片', IMAGE_TOO_LARGE: '图片超过 5 MiB，请压缩后重发',
@@ -46,8 +49,9 @@ channel.onmessage = ({ data }) => {
   else item.reject(Object.assign(new Error(data.message ?? '请求失败，请稍后重试。'), { code: data.code }));
 };
 async function request(action, args = {}) {
-  const wake = await fetch('/wake');
-  if (!wake.ok) throw new Error('无法唤醒插件，请在 Cindy 插件页启用它。');
+  // A resident logic page can answer settings even while its Node worker fails.
+  // Wake in parallel; the same-ID channel retries cover a still-opening page.
+  void fetch('/wake').catch(() => {});
   const id = crypto.randomUUID(), data = { type: 'ui-request', id, action, args };
   return new Promise((resolve, reject) => {
     const resend = setInterval(() => channel.postMessage(data), 1500);
@@ -67,6 +71,7 @@ function availablePartner(id) {
   return view.companions.some(c => c.id === id) && !view.config.bots.some(bot => bot.id !== editor?.id && bot.companionId === id);
 }
 function updateControls() {
+  for (const select of document.querySelectorAll('select')) select.disabled = busy;
   for (const button of document.querySelectorAll('button')) button.disabled = busy;
   $('add-bot').disabled = $('empty-add').disabled = busy || !loaded || !!editor || view.config.bots.length >= 32;
   for (const button of $('bots').querySelectorAll('button')) button.disabled = busy || !!editor;
@@ -82,11 +87,18 @@ async function refresh() {
   view = await request('list_bindings'); loaded = true; render(); return view;
 }
 function render() {
+  $('session-hours').value = view.config.execution?.sessionHours ?? 2;
+  $('permission-mode').value = view.config.execution?.permissionMode ?? 'bypassPermissions';
+  $('execution-summary').textContent = view.config.execution ? `项目：${view.config.execution.project || '待选择'} · ${view.config.execution.route?.model || '待选择模型'} · ${view.config.execution.route?.effort || '默认推理'}` : '尚未设置，已有 Bot 继续使用原伙伴。';
   const chatting = view.config.bots.filter(bot => bot.enabled && botState(bot.id)?.status === 'connected').length;
   $('fleet-summary').textContent = view.config.bots.length ? `共 ${view.config.bots.length} 个 Bot · ${chatting} 个聊天中` : '每个 Bot 对应一位伙伴，最多添加 32 个';
   $('empty-state').hidden = !!view.config.bots.length || !!editor;
-  const recovery = view.recoveryError?.message || (view.storageWarning ? '登录已保存，但后台状态未同步，请刷新状态检查。' : '');
+  const recovery = view.startupError ? `微信连接启动失败：${view.startupError.message}。项目、模型和记忆设置仍可使用。` : view.recoveryError?.message || (view.storageWarning ? '登录已保存，但后台状态未同步，请刷新状态检查。' : '');
   $('recovery').hidden = !recovery; $('recovery-message').textContent = recovery;
+  $('retry-save').hidden = !!view.startupError; $('retry-connection').hidden = !view.startupError;
+  if (view.nodeStarting && !startupPoll) startupPoll = setTimeout(() => {
+    startupPoll = undefined; if (!disposed) void run(refresh);
+  }, 2000);
   $('bots').replaceChildren();
   for (const bot of view.config.bots) {
     const state = botState(bot.id), companion = view.companions.find(c => c.id === bot.companionId);
@@ -96,8 +108,8 @@ function render() {
     pill.dataset.state = ['error', 'storage_error', 'needs_login', 'login_requires_action'].includes(state?.status) ? 'error' :
       bot.enabled && state?.status === 'connected' ? 'connected' : !bot.companionId || state?.status === 'reconnecting' ? 'pending' : 'idle';
     heading.append(element('h2', bot.name), pill); box.append(heading);
-    box.append(element('p', bot.companionId ? `回答伙伴：${companion?.label ?? '暂不可用'}` : '扫码成功后选择一位伙伴', 'bot-partner'));
-    box.append(element('p', !bot.companionId ? '还差一步，就能开始聊天' : !companion ? '请启用原伙伴，或编辑 Bot 选择其他伙伴' :
+    box.append(element('p', projectMode(bot) ? `项目：${bot.execution?.project || view.config.execution?.project || '待选择默认项目'}` : bot.companionId ? `回答伙伴：${companion?.label ?? '暂不可用'}` : '扫码成功后选择一位伙伴', 'bot-partner'));
+    box.append(element('p', projectMode(bot) ? '在项目中回答，记忆按 Bot 独立保存' : !bot.companionId ? '还差一步，就能开始聊天' : !companion ? '请启用原伙伴，或编辑 Bot 选择其他伙伴' :
       state?.connected ? bot.enabled ? '在微信发送消息，伙伴会在微信回复你' : '登录已保留，恢复后即可接收消息' : '扫码登录后即可在微信聊天', 'muted'));
     const stats = element('div', '', 'bot-stats');
     for (const [name, value] of [['收到', state?.stats?.received ?? 0], ['回复', state?.stats?.delivered ?? 0]]) {
@@ -108,11 +120,40 @@ function render() {
     if (retry) box.append(element('p', retry.withdrawing ? '新消息已合并，正在核实旧投递已撤回，确认后自动转交伙伴' : `最近微信请求：转交伙伴失败，将于 ${new Date(retry.retryAt).toLocaleTimeString()} 自动重试（第 ${retry.attempt}/2 次）`, 'bot-error'));
     else if (state?.lastErrorCode) box.append(element('p', messageErrors[state.lastErrorCode] ?? `最近连接异常：${state.lastErrorCode}，请刷新状态或重新扫码`, 'bot-error'));
     const guideState = view.bindingGuides?.find(item => item.id === bot.id)?.state ?? 'required';
-    if (bot.companionId && guideMessages[guideState]) box.append(element('p', guideMessages[guideState], 'muted'));
+    if (!projectMode(bot) && bot.companionId && guideMessages[guideState]) box.append(element('p', guideMessages[guideState], 'muted'));
     const actions = element('div', '', 'actions');
     const add = (container, name, handler, cls) => {
       const button = element('button', name, cls); button.type = 'button'; button.onclick = () => run(handler); container.append(button);
     };
+    const destination = element('select'); destination.setAttribute?.('aria-label', `${bot.name} 的回答方式`);
+    const emptyTarget = element('option', '选择回答方式'); emptyTarget.value = ''; destination.append(emptyTarget);
+    const projectTarget = element('option', '在项目中回答'); projectTarget.value = 'project'; destination.append(projectTarget);
+    for (const candidate of view.companions) {
+      const option = element('option', `转接伙伴：${candidate.label}`); option.value = `companion:${candidate.id}`;
+      option.disabled = view.config.bots.some(item => item.id !== bot.id && item.companionId === candidate.id); destination.append(option);
+    }
+    destination.value = projectMode(bot) ? 'project' : bot.companionId ? `companion:${bot.companionId}` : '';
+    destination.onchange = () => run(async () => {
+      if (!destination.value) return;
+      try {
+        const args = destination.value === 'project' ? { id: bot.id, mode: 'project' } : { id: bot.id, mode: 'companion', companionId: destination.value.slice(10) };
+        const result = await request('save_bot_route', args); view.config = result.config; render(); notice('此 Bot 的回答方式已保存。');
+      } catch (error) { render(); throw error; }
+    });
+    box.append(element('label', '回答方式（选择即保存）'), destination);
+    if (projectMode(bot)) {
+      const route = bot.execution?.route || view.config.execution?.route;
+      box.append(element('p', `${bot.execution?.route ? '独立模型' : '继承默认模型'}：${route?.model || '待选择'} · ${route?.effort || '默认推理'}`, 'muted'));
+      add(actions, '选择此 Bot 的模型与推理档位', async () => {
+        const picked = await request('pick_model', { id: bot.id });
+        if (!picked.ok) { if (picked.errorCode !== 'CANCELLED') throw new Error(picked.message || '选择模型失败。'); return; }
+        const result = await request('save_bot_route', { id: bot.id, mode: 'project', execution: { project: bot.execution?.project || '', route: picked.route } });
+        view.config = result.config; render(); notice('此 Bot 的模型与推理档位已保存，其他 Bot 不变。');
+      });
+      if (bot.execution?.route) add(actions, '恢复默认模型', async () => {
+        const result = await request('save_bot_route', { id: bot.id, execution: { project: bot.execution?.project || '', route: null } }); view.config = result.config; render();
+      });
+    }
     if (!bot.companionId) add(actions, state?.connected && state.status === 'paused' ? '选择伙伴' : '继续扫码',
       () => state?.connected && state.status === 'paused' ? openBinding(bot.id, true) : beginLogin(bot.id), 'primary');
     else {
@@ -121,13 +162,17 @@ function render() {
         notice(bot.enabled ? `“${bot.name}”已暂停，登录已保留。` : `“${bot.name}”已恢复聊天。`);
       }, 'primary');
       else add(actions, '扫码登录', () => beginLogin(bot.id), 'primary');
-      add(actions, '编辑 Bot', () => openBinding(bot.id, false));
-      if (guideState === 'ready' && view.bindingGuides?.find(item => item.id === bot.id)?.updateAvailable)
+      if (!projectMode(bot)) add(actions, '编辑 Bot', () => openBinding(bot.id, false));
+      else add(actions, '修改名称', async () => {
+        const name = prompt('Bot 名称', bot.name); if (name === null || !name.trim()) return;
+        view = await request('upsert_binding', { id: bot.id, name: name.trim(), companion_id: bot.companionId, enabled: bot.enabled }); render();
+      });
+      if (!projectMode(bot) && guideState === 'ready' && view.bindingGuides?.find(item => item.id === bot.id)?.updateAvailable)
         add(actions, '更新伙伴说明', async () => {
           view = await request('prepare_binding', { id: bot.id }); render();
           notice('已提交新版伙伴说明，包含主动发送微信的用法。');
         });
-      if (['required', 'failed', 'unknown'].includes(guideState)) add(actions, guideState === 'required' ? '发送伙伴说明' : '核实并重试伙伴说明', async () => {
+      if (!projectMode(bot) && ['required', 'failed', 'unknown'].includes(guideState)) add(actions, guideState === 'required' ? '发送伙伴说明' : '核实并重试伙伴说明', async () => {
         view = await request('prepare_binding', { id: bot.id, retry: guideState !== 'required' }); render();
         notice('说明回执已更新；只有确认处理完成后才会派发微信消息。并不保证伙伴已写入长期记忆。');
       });
@@ -135,6 +180,14 @@ function render() {
     box.append(actions);
     const manage = element('details'); manage.append(element('summary', '管理 Bot'));
     const management = element('div', '', 'actions');
+    const memory = view.memories?.find(item => item.id === bot.id);
+    manage.append(element('p', `独立记忆：${memory?.characters ?? 0} 字`, 'muted'));
+    if (memory?.error) manage.append(element('p', memory.error, 'bot-error'));
+    add(management, '清空这个 Bot 的记忆', async () => {
+      if (!confirm(`清空“${bot.name}”的长期记忆？其他 Bot 的记忆和微信登录不受影响。`)) return;
+      const result = await request('clear_memory', { id: bot.id });
+      view.memories = [...(view.memories ?? []).filter(item => item.id !== bot.id), result.memory]; render(); notice(`“${bot.name}”的记忆已清空。`);
+    });
     if (state?.connected) {
       add(management, '重新扫码', () => beginLogin(bot.id));
       add(management, '退出登录', async () => {
@@ -237,6 +290,31 @@ async function addBot() {
   view = await request('add_bot'); loaded = true; render(); await beginLogin(view.addedBotId);
 }
 $('add-bot').onclick = $('empty-add').onclick = () => run(addBot);
+async function loadProjects() {
+  const result = await request('list_projects'); $('default-project').replaceChildren();
+  const empty = element('option', result.targets.length ? '请选择项目（选择即保存）' : '没有可用项目，请先在 Cindy 添加项目'); empty.value = ''; $('default-project').append(empty);
+  for (const target of result.targets) { const option = element('option', `${target.label} — ${target.id}`); option.value = target.id; option.selected = target.id === view.config.execution?.project; $('default-project').append(option); }
+}
+$('load-projects').onclick = () => run(async () => { await loadProjects(); notice('项目列表已刷新。'); });
+$('pick-project').onclick = () => run(async () => {
+  const result = await request('pick_project');
+  if (result.ok) { view.config = result.config; render(); await loadProjects(); notice('项目目录已保存。'); }
+  else if (result.errorCode !== 'CANCELLED') throw new Error(result.message || '目录选择失败，请稍后重试。');
+});
+$('pick-model').onclick = () => run(async () => {
+  const { x, y, width, height } = $('pick-model').getBoundingClientRect();
+  const result = typeof window.cindyUI?.pickModel === 'function'
+    ? await window.cindyUI.pickModel({ anchor: { x, y, width, height }, allowRemote: false, ...(view.config.execution?.route ? { initial: view.config.execution.route } : {}) })
+    : await request('pick_model');
+  if (result.ok) { const saved = await request('save_execution', { route: result.route }); view.config = saved.config; render(); notice('模型和推理档位已保存。'); }
+  else if (result.errorCode !== 'CANCELLED') throw new Error(result.message || '模型选择失败，请重试。');
+});
+$('default-project').onchange = () => run(async () => {
+  const project = $('default-project').value;
+  if (!project) return;
+  try { const result = await request('save_execution', { project }); view.config = result.config; render(); notice('默认项目已保存。'); }
+  catch (error) { $('default-project').value = view.config.execution?.project || ''; throw error; }
+});
 $('binding-name').oninput = updateControls;
 $('binding-form').onsubmit = event => {
   event.preventDefault(); void run(async () => {
@@ -270,8 +348,12 @@ $('retry-save').onclick = () => run(async () => {
   if (editor?.mode === 'login' && bot && !bot.companionId && botState(bot.id)?.connected && botState(bot.id)?.status === 'paused') openBinding(bot.id, true);
   notice('登录记录已安全保存。');
 });
+$('retry-connection').onclick = () => run(async () => { view = await request('retry_connection'); render(); });
 window.addEventListener('pagehide', () => {
   disposed = true; loginGeneration++; channel.close();
+  if (startupPoll) clearTimeout(startupPoll);
   for (const item of pending.values()) { clearInterval(item.resend); clearTimeout(item.timeout); } pending.clear();
 });
-void run(async () => { await refresh(); if (view.capabilityError) notice(view.capabilityError.message, true); });
+void run(async () => { await refresh(); await loadProjects(); if (view.capabilityError) notice(view.capabilityError.message, true); });
+
+for (const [id, key] of [['session-hours','sessionHours'],['permission-mode','permissionMode']]) $(id).onchange = () => run(async () => { const value = key === 'sessionHours' ? Number($(id).value) : $(id).value; const result = await request('save_execution', { [key]: value }); view.config = result.config; render(); notice('会话设置已保存。'); });
