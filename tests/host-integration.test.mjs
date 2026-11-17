@@ -94,8 +94,8 @@ test('project mode persists Bot memory, restores it on restart and rejects forei
 function makeHost(shared) {
   if (!shared.legacyGuides && !shared.config.bindingGuides) shared.config.bindingGuides = shared.config.bots.filter(bot => bot.companionId).map(bot =>
     ({ botId: bot.id, companionId: bot.companionId, key: `wx-guide-fixture-${bot.id}`, state: 'ready', sessionId: 'session-a' }));
-  const cancelledKeys = new Set(), failedKeys = new Set();
-  const handlers = [], results = [], dispatches = [], guideDispatches = [], deliveries = [], notifications = [], timers = [], receiptQueries = [], channels = []; let qrCalls = 0, sequence = 0;
+  const cancelledKeys = new Set(), failedKeys = new Set(), activeCalls = new Set();
+  const handlers = [], results = [], dispatches = [], guideDispatches = [], deliveries = [], notifications = [], timers = [], receiptQueries = [], channels = [], nodeRequests = []; let qrCalls = 0, sequence = 0;
   const manager = new BotManager({ clientFactory: opts => ({
     begin: async () => { qrCalls++; return { qrcode: `test-${sequence++}`, qrcode_img_content: 'https://ilinkai.weixin.qq.com/scan' }; },
     pollQr: async () => ({ status: 'confirmed', bot_token: 'private-token-test', ilink_bot_id: 'wx-test', ilink_user_id: 'owner-test', baseurl: 'https://ilinkai.weixin.qq.com' }),
@@ -150,7 +150,11 @@ function makeHost(shared) {
       if (req.op === 'delete' && shared.failDelete) return { ok: false, message: 'test deletion failed' };
       if (req.op === 'write') shared.file = req.content; if (req.op === 'delete') shared.file = null; return { ok: true };
     },
-    node: { request: async ({ method, params, timeoutMs, maxTotalMs }) => {
+    node: { request: async request => {
+      const { method, params, timeoutMs, maxTotalMs, callId, cancelWithCall } = request;
+      nodeRequests.push(request);
+      if (cancelWithCall === true && (typeof callId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(callId) || !activeCalls.has(callId)))
+        return { ok: false, errorCode: 'INVALID_REQUEST', message: 'callId must identify the current tool call' };
       if (shared.nodeStartupFailure) throw Object.assign(new Error('Node工作进程启动超时'), { code: 'NODE_START_TIMEOUT' });
       assert.ok(Buffer.byteLength(JSON.stringify(params)) <= 256 * 1024, 'Host params size limit');
       assert.ok(timeoutMs >= 1000 && timeoutMs <= 120000, 'Host timeout range');
@@ -193,7 +197,7 @@ function makeHost(shared) {
       if (this?.cindy !== cindy) throw new TypeError('Illegal invocation');
       const index = timers.indexOf(timer); if (index !== -1) timers.splice(index, 1);
     } });
-  return { manager, dispatches, guideDispatches, deliveries, receiptQueries, timers,
+  return { manager, dispatches, guideDispatches, deliveries, receiptQueries, timers, nodeRequests,
     tickReceipt: async () => { const timer = timers.shift(); assert.ok(timer); await timer.callback(); },
     hostMessage: async msg => { for (const handler of handlers) await handler(msg); },
     drainEvents: async () => { await Promise.all(notifications.splice(0)); }, event: async (method, params) => { for (const handler of handlers) await handler({ type: 'event', name: 'node-notification', method, params }); },
@@ -201,7 +205,9 @@ function makeHost(shared) {
       const id = webcrypto.randomUUID(); await channels[0].onmessage({ data: { type: 'ui-request', id, action, args, ...(mobilePageId ? {mobilePageId} : {}) } });
       assert.equal(channels[0].last.id, id); return channels[0].last;
     }, tool: async (tool, args = {}) => {
-    const callId = `call-${sequence++}`; for (const handler of handlers) await handler({ type: 'tool-call', tool, args, callId });
+    const callId = `call-${sequence++}`; activeCalls.add(callId);
+    try { for (const handler of handlers) await handler({ type: 'tool-call', tool, args, callId }); }
+    finally { activeCalls.delete(callId); }
     const response = results.find(result => result.callId === callId); assert.ok(response, 'tool receipt exists'); return response;
   } };
 }
@@ -305,6 +311,29 @@ test('UI adds an unpaired Bot, saves QR login, then starts chatting without anot
   const state = third.manager.bot(id);
   third.manager.ingest(state, state.generation, { message_id: 1, message_type: 1, from_user_id: 'family', context_token: 'private-context', item_list: [{ type: 1, text_item: { text: '你好' } }] });
   await third.drainEvents(); assert.equal(third.dispatches[0].target.id, 'buddy-a'); third.manager.close();
+});
+test('settings QR operations use independent Node requests while tool calls bind their own lifetime', async t => {
+  const shared = { config: { bots: [] }, key: null, file: null }, host = makeHost(shared);
+  t.after(() => host.manager.close());
+  const added = await host.ui('add_bot'); assert.equal(added.ok, true);
+  const id = added.result.addedBotId;
+  assert.equal((await host.ui('begin_login', { id }, 'mobile-page')).ok, true);
+  assert.equal((await host.ui('cancel_login', { id }, 'mobile-page')).ok, true);
+  assert.equal((await host.ui('begin_login', { id })).ok, true);
+  assert.equal((await host.ui('check_login', { id })).ok, true);
+  assert.equal((await host.ui('disconnect_bot', { id })).ok, true);
+  const uiRequests = host.nodeRequests.filter(req => ['auth/begin', 'auth/check', 'auth/cancel', 'disconnect/prepare', 'disconnect'].includes(req.method));
+  assert.ok(uiRequests.length >= 6);
+  for (const req of uiRequests) {
+    assert.equal(Object.hasOwn(req, 'callId'), false);
+    assert.equal(Object.hasOwn(req, 'cancelWithCall'), false);
+  }
+  const start = host.nodeRequests.length;
+  assert.equal((await host.tool('begin_login', { id })).ok, true);
+  assert.equal((await host.tool('cancel_login', { id })).ok, true);
+  const toolRequests = host.nodeRequests.slice(start).filter(req => ['auth/begin', 'auth/cancel'].includes(req.method));
+  assert.equal(toolRequests.length, 2);
+  for (const req of toolRequests) { assert.match(req.callId, /^call-/); assert.equal(req.cancelWithCall, true); }
 });
 test('UI creates distinct drafts and names, and cancels one without removing another Bot', async () => {
   const shared = { config: { bots: [] }, key: null, file: null }, host = makeHost(shared);

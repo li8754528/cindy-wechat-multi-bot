@@ -1076,7 +1076,7 @@
       params,
       timeoutMs: method === "reply" || method === "auth/check" ? 12e4 : 45e3,
       ...method === "reply" ? { maxTotalMs: 24e4 } : {},
-      ...msg ? { callId: msg.callId, cancelWithCall: true } : {}
+      ...msg?.type === "tool-call" ? { callId: msg.callId, cancelWithCall: true } : {}
     });
     return unwrapNode(response);
   }
@@ -1278,7 +1278,7 @@
     }
     const bindingGuides = [];
     for (const bot of config.bots) if (!botProjectMode(bot, config.execution)) bindingGuides.push(await guides.refresh(bot));
-    return { plugin: { id: "wechat-companion", name: "\u5FAE\u4FE1\u4F19\u4F34", version: "0.4.3" }, config, runtime, nodeStarting: booting, companions, bindingGuides, memories: config.bots.map((bot) => ({ ...memories.status(bot.id), error: memoryErrors[bot.id] })), startupError, dispatchRetries: router.pendingRetries(), recoveryError, capabilityError, storageWarning: store.lastWarning };
+    return { plugin: { id: "wechat-companion", name: "\u5FAE\u4FE1\u4F19\u4F34", version: "0.4.4" }, config, runtime, nodeStarting: booting, companions, bindingGuides, memories: config.bots.map((bot) => ({ ...memories.status(bot.id), error: memoryErrors[bot.id] })), startupError, dispatchRetries: router.pendingRetries(), recoveryError, capabilityError, storageWarning: store.lastWarning };
   }
   async function command(action, args = {}, msg) {
     await loadConfig();

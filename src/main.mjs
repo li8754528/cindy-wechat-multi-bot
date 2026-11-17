@@ -20,7 +20,7 @@ const memoryCalls = new Map();
 async function node(method, params = {}, msg) {
   const response = await cindy.node.request({ method, params, timeoutMs: method === 'reply' || method === 'auth/check' ? 120000 : 45000,
     ...(method === 'reply' ? { maxTotalMs: 240000 } : {}),
-    ...(msg ? { callId: msg.callId, cancelWithCall: true } : {}) });
+    ...(msg?.type === 'tool-call' ? { callId: msg.callId, cancelWithCall: true } : {}) });
   return unwrapNode(response);
 }
 const router = new ReplyRouter({ targets: cindy.targets, tasks: cindy.tasks, readImages: readGrantedImages,
@@ -138,7 +138,7 @@ async function snapshot() {
   catch (err) { capabilityError = { code: err.code ?? 'TARGET_UNAVAILABLE', message: '伙伴列表不可用，仍可停用或删除已有绑定。' }; }
   const bindingGuides = [];
   for (const bot of config.bots) if (!botProjectMode(bot, config.execution)) bindingGuides.push(await guides.refresh(bot));
-  return { plugin: { id: 'wechat-companion', name: '微信伙伴', version: '0.4.3' }, config, runtime, nodeStarting: booting, companions, bindingGuides, memories: config.bots.map(bot => ({ ...memories.status(bot.id), error: memoryErrors[bot.id] })), startupError, dispatchRetries: router.pendingRetries(), recoveryError, capabilityError, storageWarning: store.lastWarning };
+  return { plugin: { id: 'wechat-companion', name: '微信伙伴', version: '0.4.4' }, config, runtime, nodeStarting: booting, companions, bindingGuides, memories: config.bots.map(bot => ({ ...memories.status(bot.id), error: memoryErrors[bot.id] })), startupError, dispatchRetries: router.pendingRetries(), recoveryError, capabilityError, storageWarning: store.lastWarning };
 }
 async function command(action, args = {}, msg) {
   await loadConfig();
